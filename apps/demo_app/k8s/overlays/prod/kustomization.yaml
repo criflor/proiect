@@ -1,0 +1,16 @@
+# Mediul de producție (cerințele 6-8) - urmărit de Argo CD pe branch-ul
+# "main" al repo-ului demo-app-manifests, actualizat DOAR prin Merge Request
+# aprobat manual (vezi apps/demo_app/.gitlab-ci.yml, job "update-manifests").
+# Fără prefix de nume - e mediul original, neschimbat față de dinainte de
+# introducerea mediului "dev".
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: demo-app
+
+resources:
+  - ../../base
+
+images:
+  - name: gitlab.kube-dev.local:5050/appadm/demo-app
+    newTag: e70e2a3f

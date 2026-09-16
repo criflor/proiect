@@ -1,0 +1,21 @@
+# Configurare non-secretă a aplicației - separată explicit de Secret-uri
+# (parole/chei), care rămân în Secret-uri Kubernetes (vezi app.yaml).
+# Orice schimbare aici ajunge în cluster doar după merge manual al Merge
+# Request-ului deschis automat în proiectul demo-app-manifests (cerința 8).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: demo-app-config
+  namespace: demo-app
+data:
+  APP_ENV: production
+  LOG_LEVEL: info
+  # Trace-uri trimise via OTLP către colectorul din cluster (cerința 10 -
+  # monitorizare) - vezi k3s/files/otel-collector-config.yaml.
+  OTEL_SERVICE_NAME: demo-app
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector.monitoring.svc.cluster.local:4317"
+  OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+  OTEL_TRACES_EXPORTER: otlp
+  OTEL_METRICS_EXPORTER: none
+  OTEL_LOGS_EXPORTER: none
+  OTEL_PYTHON_LOG_CORRELATION: "false"

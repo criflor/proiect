@@ -1,0 +1,134 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-app
+  namespace: demo-app
+  # Reloader (§18_install_reloader.yml) - repornește automat pod-urile când
+  # ConfigMap-ul sau Secret-urile referite (demo-app-config,
+  # postgres-credentials, demo-app-secret) se schimbă. Necesar în special
+  # pentru secretele ESO (§17) - variabilele de mediu se citesc o singură
+  # dată la pornire, altfel un pod deja rulat n-ar prinde niciodată o parolă
+  # rotită în Vault.
+  annotations:
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: demo-app
+  template:
+    metadata:
+      labels:
+        app: demo-app
+    spec:
+      # Imagine publicată de pipeline-ul CI/CD (cerința 6) în registry-ul
+      # integrat GitLab. Tag-ul e SHA-ul scurt al commit-ului care a fost
+      # efectiv construit și verificat în registry la acel pas (vezi
+      # documentatie.md secțiunea 7.2) - NU "latest", tocmai ca acest
+      # manifest să fie legat explicit de o imagine anume, reproductibilă,
+      # nu de orice se întâmplă să fie "cel mai recent" build în registry.
+      imagePullSecrets:
+        - name: gitlab-registry-pull
+      containers:
+        - name: demo-app
+          image: gitlab.kube-dev.local:5050/appadm/demo-app:e70e2a3f
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: demo-app-config
+          env:
+            - name: DB_HOST
+              value: postgres.demo-app.svc.cluster.local
+            - name: DB_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: POSTGRES_DB
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: POSTGRES_USER
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: POSTGRES_PASSWORD
+            - name: FLASK_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: demo-app-secret
+                  key: FLASK_SECRET_KEY
+          # Container securizat: fără privilegii, fără escaladare, filesystem
+          # read-only (sesiunea Flask e un cookie semnat client-side, nu are
+          # nevoie de scriere pe disc).
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          # gunicorn are nevoie de /tmp scriabil (fișiere temporare per worker),
+          # chiar și cu filesystem-ul rădăcină read-only.
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: shared-data
+              mountPath: /app/shared-data
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: shared-data
+          persistentVolumeClaim:
+            claimName: demo-app-shared-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-app
+  namespace: demo-app
+spec:
+  selector:
+    app: demo-app
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: demo-app
+  namespace: demo-app
+spec:
+  parentRefs:
+    - name: kube-dev-gateway
+      namespace: gateway
+      sectionName: https
+  hostnames:
+    - "demo.kube-dev.local"
+  rules:
+    - backendRefs:
+        - name: demo-app
+          port: 80

@@ -1,0 +1,46 @@
+# Mediul de dev (comun, un singur set de resurse "dev-*", nu unul per
+# branch) - actualizat automat la orice push pe un branch diferit de "main"
+# (vezi apps/demo_app/.gitlab-ci.yml, job "update-manifests"), pe branch-ul
+# separat "dev" al repo-ului demo-app-manifests, FĂRĂ Merge Request (branch
+# neprotejat - buclă rapidă de dezvoltare, spre deosebire de "main"/prod care
+# rămâne strict prin MR aprobat manual, cerința 8).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: demo-app-dev
+namePrefix: dev-
+
+resources:
+  - ../../base
+
+patches:
+  - path: patch-hostname.yaml
+  - path: patch-db-host.yaml
+  # "remoteRef.key" (calea din Vault) e string literal, ca DB_HOST și
+  # backendRefs.name mai sus - JSON6902 (nu strategic-merge), fiindcă
+  # "spec.data" e o listă simplă, fără merge key recunoscut de kustomize
+  # pentru acest CRD.
+  - target:
+      kind: ExternalSecret
+      name: postgres-credentials
+    patch: |-
+      - op: replace
+        path: /spec/data/0/remoteRef/key
+        value: demo-app/dev/postgres
+      - op: replace
+        path: /spec/data/1/remoteRef/key
+        value: demo-app/dev/postgres
+      - op: replace
+        path: /spec/data/2/remoteRef/key
+        value: demo-app/dev/postgres
+  - target:
+      kind: ExternalSecret
+      name: demo-app-secret
+    patch: |-
+      - op: replace
+        path: /spec/data/0/remoteRef/key
+        value: demo-app/dev/flask
+
+images:
+  - name: gitlab.kube-dev.local:5050/appadm/demo-app
+    newTag: e70e2a3f

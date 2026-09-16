@@ -1,6 +1,2 @@
 __pycache__/
 *.pyc
-
-# Manifestele Kubernetes au propriul proiect GitLab separat (cerința 7) -
-# nu fac parte din repo-ul de cod sursă al aplicației.
-/k8s/

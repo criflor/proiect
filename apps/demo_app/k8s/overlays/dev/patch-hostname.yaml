@@ -1,0 +1,22 @@
+# Hostname propriu pentru mediul de dev (altfel ar coincide cu cel de
+# producție, imposibil de rutat separat prin Gateway). Numele resursei rămâne
+# cel din base ("demo-app") - kustomize potrivește patch-ul înainte de a
+# aplica namePrefix-ul din kustomization.yaml.
+#
+# backendRefs.name e un câmp propriu CRD-ului Gateway API - kustomize NU îl
+# recunoaște ca referință de renumit automat (spre deosebire de
+# secretKeyRef/configMapRef/claimName, care SUNT actualizate automat) - la
+# fel ca DB_HOST (vezi patch-db-host.yaml), trebuie corectat manual aici cu
+# numele final al Service-ului din mediul dev ("dev-demo-app").
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: demo-app
+  namespace: demo-app
+spec:
+  hostnames:
+    - "dev-demo.kube-dev.local"
+  rules:
+    - backendRefs:
+        - name: dev-demo-app
+          port: 80

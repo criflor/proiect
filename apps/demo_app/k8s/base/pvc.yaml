@@ -1,0 +1,16 @@
+# Stocare partajată a aplicației (nu baza de date - aceea rămâne pe
+# local-path, vezi postgres.yaml și documentatie.md secțiunea 6).
+# StorageClass "nfs" = provisionerul dinamic instalat la cerința 5
+# (k3s/playbooks/08_install_nfs_storageclass.yml) - RWX, accesibil simultan
+# de ambele replici ale Deployment-ului, ceva ce local-path nu poate oferi.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: demo-app-shared-data
+  namespace: demo-app
+spec:
+  accessModes: ["ReadWriteMany"]
+  storageClassName: nfs
+  resources:
+    requests:
+      storage: 1Gi

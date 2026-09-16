@@ -1,0 +1,68 @@
+# Segmentare de rețea: baza de date acceptă conexiuni DOAR de la pod-urile
+# aplicației, pe portul 5432 - nimic altceva din cluster nu poate vorbi direct
+# cu Postgres, nici măcar alte pod-uri din același namespace.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: postgres-allow-from-app-only
+  namespace: demo-app
+spec:
+  endpointSelector:
+    matchLabels:
+      app: postgres
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            app: demo-app
+      toPorts:
+        - ports:
+            - port: "5432"
+              protocol: TCP
+---
+# Aplicația acceptă trafic HTTP doar dinspre Cilium Envoy (Gateway-ul
+# clusterului) - nu e nevoie de acces direct la pod din afara Gateway-ului.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: demo-app-allow-from-gateway-only
+  namespace: demo-app
+spec:
+  endpointSelector:
+    matchLabels:
+      app: demo-app
+  ingress:
+    - fromEntities:
+        - cluster
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            app: postgres
+      toPorts:
+        - ports:
+            - port: "5432"
+              protocol: TCP
+    - toEndpoints:
+        - matchLabels:
+            "k8s:io.kubernetes.pod.namespace": kube-system
+            k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+            - port: "53"
+              protocol: TCP
+    # Trace-uri OTLP către colectorul din cluster (cerința 10 - monitorizare,
+    # instrumentare automată OpenTelemetry) - fără această regulă, politica
+    # de mai sus (deny implicit odată ce există egress) ar bloca exportul.
+    - toEndpoints:
+        - matchLabels:
+            "k8s:io.kubernetes.pod.namespace": monitoring
+            app: otel-collector
+      toPorts:
+        - ports:
+            - port: "4317"
+              protocol: TCP

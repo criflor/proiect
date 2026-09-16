@@ -1,0 +1,14 @@
+# Resursele comune ale aplicației demo (fără Namespace - creat direct de
+# Ansible, nu prin GitOps, la fel ca Secret-urile runtime - vezi
+# kubernetes_cluster/k3s/playbooks/07_deploy_demo_app.yml). Namespace-ul și
+# tag-ul imaginii diferă între medii (prod/dev) - vezi overlays/.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - app.yaml
+  - postgres.yaml
+  - configmap.yaml
+  - network-policy.yaml
+  - pvc.yaml
+  - external-secrets.yaml

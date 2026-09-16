@@ -1,0 +1,18 @@
+# DB_HOST e un string literal (nu o referință recunoscută de kustomize),
+# deci namePrefix/namespace nu-l actualizează automat ca la
+# secretKeyRef/configMapRef/claimName (acelea SUNT actualizate automat) -
+# trebuie corectat manual aici cu numele final al Service-ului Postgres din
+# mediul dev ("dev-postgres", namespace "demo-app-dev").
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-app
+  namespace: demo-app
+spec:
+  template:
+    spec:
+      containers:
+        - name: demo-app
+          env:
+            - name: DB_HOST
+              value: dev-postgres.demo-app-dev.svc.cluster.local
