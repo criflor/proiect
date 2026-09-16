@@ -1,0 +1,214 @@
+---
+# Instalează Argo CD CLI pe mașina de control, Argo CD server în cluster
+# (Helm) și configurează o Application care urmărește repo-ul GitLab de
+# manifeste (cerința 7), cu sincronizare automată (cerința 8).
+- name: Instalare Argo CD CLI (mașina de control)
+  hosts: localhost
+  connection: local
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Verifică dacă argocd CLI e deja instalat
+      ansible.builtin.stat:
+        path: /usr/local/bin/argocd
+      register: argocd_cli_check
+
+    - name: Descarcă și instalează argocd CLI (ultima versiune stabilă)
+      ansible.builtin.get_url:
+        url: https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+        dest: /usr/local/bin/argocd
+        mode: "0755"
+      when: not argocd_cli_check.stat.exists
+
+- name: Instalare și configurare Argo CD
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+
+  vars:
+    kubeconfig: "{{ local_kubeconfig_path }}"
+    gitlab_hostname: gitlab.kube-dev.local
+    gitlab_ca_file: "{{ playbook_dir }}/../files/gitlab-kube-dev-local-ca.crt"
+    vault_manifests_deploy_token_path: secret/data/gitlab/manifests_deploy_token
+    vault_argocd_password_path: secret/data/argocd/admin_password
+
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+
+  tasks:
+    - name: Adaugă/actualizează repo-ul Helm al Argo CD
+      ansible.builtin.command:
+        cmd: helm repo add argo https://argoproj.github.io/argo-helm
+      register: helm_repo_add
+      changed_when: "'has been added' in helm_repo_add.stdout"
+
+    - name: Instalează/actualizează Argo CD via Helm
+      ansible.builtin.command:
+        cmd: >
+          helm upgrade --install argocd argo/argo-cd
+          --namespace argocd
+          --create-namespace
+          --values {{ playbook_dir }}/../files/argocd-values.yaml
+      register: argocd_helm
+      changed_when: "'has been upgraded' in argocd_helm.stdout or 'has been installed' in argocd_helm.stdout"
+
+    - name: Așteaptă ca argocd-server să fie disponibil
+      ansible.builtin.command:
+        cmd: kubectl -n argocd rollout status deployment/argocd-server --timeout=180s
+      changed_when: false
+
+    - name: Citește tokenul root Vault
+      ansible.builtin.slurp:
+        src: "{{ vault_init_file }}"
+      register: vault_root_read
+
+    - name: Citește deploy token-ul pentru repo-ul de manifeste din Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/{{ vault_manifests_deploy_token_path }}"
+        validate_certs: false
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+      register: manifests_token_read
+      no_log: true
+
+    # Argo CD (repo-server) trebuie să aibă încredere în CA-ul GitLab ca să
+    # poată clona repo-ul de manifeste prin HTTPS - se configurează per
+    # hostname, în ConfigMap-ul dedicat al chart-ului.
+    - name: Configurează încrederea Argo CD în CA-ul GitLab
+      ansible.builtin.shell:
+        cmd: >
+          kubectl -n argocd create configmap argocd-tls-certs-cm
+          --from-file={{ gitlab_hostname }}={{ gitlab_ca_file }}
+          --dry-run=client -o yaml | kubectl apply -f -
+      register: tls_cm_apply
+      changed_when: "'unchanged' not in tls_cm_apply.stdout"
+
+    # repo-server montează acest ConfigMap ca volum; dacă pod-ul a pornit
+    # chiar în fereastra Helm install -> configurare cert (instalare
+    # proaspătă), poate prinde o versiune goală a volumului și nu o mai
+    # resincronizează singur curând. Un restart explicit elimină cursa asta.
+    - name: Repornește repo-server ca să preia sigur certificatul CA
+      ansible.builtin.command:
+        cmd: kubectl -n argocd rollout restart deployment/argocd-repo-server
+      when: tls_cm_apply.changed
+
+    - name: Așteaptă ca repo-server să fie disponibil după repornire
+      ansible.builtin.command:
+        cmd: kubectl -n argocd rollout status deployment/argocd-repo-server --timeout=120s
+      when: tls_cm_apply.changed
+      changed_when: false
+
+    # Credențialele repo-ului, ca Secret Kubernetes cu eticheta standard
+    # Argo CD (abordare declarativă, nu "argocd repo add" interactiv).
+    - name: Configurează credențialele repo-ului de manifeste
+      ansible.builtin.shell:
+        cmd: >
+          kubectl -n argocd create secret generic demo-app-manifests-repo
+          --from-literal=type=git
+          --from-literal=url=https://{{ gitlab_hostname }}/appadm/demo-app-manifests.git
+          --from-literal=username={{ manifests_token_read.json.data.data.username | quote }}
+          --from-literal=password={{ manifests_token_read.json.data.data.token | quote }}
+          --dry-run=client -o yaml
+          | kubectl label --local -f - -o yaml argocd.argoproj.io/secret-type=repository
+          | kubectl apply -f -
+      register: repo_secret_apply
+      changed_when: "'unchanged' not in repo_secret_apply.stdout"
+      no_log: true
+
+    - name: Aplică Application-ul Argo CD de producție (overlays/prod, branch main, sync automat)
+      ansible.builtin.command:
+        cmd: "kubectl apply -f {{ playbook_dir }}/../files/argocd-application.yaml"
+      register: app_apply
+      changed_when: "'unchanged' not in app_apply.stdout"
+
+    # Application-ul de dev urmărește branch-ul separat "dev" al aceluiași
+    # repo, creat abia la primul push CI de pe un branch diferit de "main"
+    # (vezi apps/demo_app/.gitlab-ci.yml) - poate să nu existe încă la
+    # prima instalare a clusterului, de-aia sincronizarea lui de mai jos nu
+    # blochează playbook-ul dacă branch-ul lipsește.
+    - name: Aplică Application-ul Argo CD de dev (overlays/dev, branch dev, sync automat)
+      ansible.builtin.command:
+        cmd: "kubectl apply -f {{ playbook_dir }}/../files/argocd-application-dev.yaml"
+      register: app_dev_apply
+      changed_when: "'unchanged' not in app_dev_apply.stdout"
+
+    - name: Expune UI-ul Argo CD prin Gateway
+      ansible.builtin.command:
+        cmd: "kubectl apply -f {{ playbook_dir }}/../files/argocd-httproute.yaml"
+      register: route_apply
+      changed_when: "'unchanged' not in route_apply.stdout"
+
+    - name: Citește parola inițială de admin (dacă secretul mai există)
+      ansible.builtin.command:
+        cmd: kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath={.data.password}
+      register: admin_pw_b64
+      failed_when: false
+      changed_when: false
+
+    # Scrisă necondiționat (nu doar "o singură dată") - secretul inițial
+    # Argo CD e șters de obicei manual după prima logare, deci task-ul de mai
+    # sus nu va mai găsi nimic la rulările următoare; Vault păstrează totuși
+    # valoarea citită la prima rulare.
+    - name: Scrie parola de admin Argo CD în Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/{{ vault_argocd_password_path }}"
+        validate_certs: false
+        method: POST
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        body_format: json
+        body:
+          data:
+            value: "{{ admin_pw_b64.stdout | b64decode }}"
+        status_code: 200
+      when: admin_pw_b64.rc == 0 and admin_pw_b64.stdout | length > 0
+      no_log: true
+
+    - name: Adaugă argocd.kube-dev.local în /etc/hosts (mașina de control)
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        line: "10.10.10.192 argocd.kube-dev.local"
+        regexp: "argocd\\.kube-dev\\.local$"
+      become: true
+
+    # Nu se așteaptă intervalul de polling implicit al Argo CD (~3 minute) -
+    # se cere explicit o sincronizare imediată.
+    - name: Declanșează o sincronizare imediată (nu se așteaptă polling-ul implicit)
+      ansible.builtin.command:
+        cmd: >
+          kubectl -n argocd patch application demo-app --type merge
+          -p {{ '{"operation":{"sync":{}}}' | quote }}
+      changed_when: true
+
+    - name: Așteaptă sincronizarea Application-ului demo-app (producție)
+      ansible.builtin.command:
+        cmd: kubectl -n argocd get application demo-app -o jsonpath={.status.sync.status}
+      register: sync_status
+      until: sync_status.stdout == "Synced"
+      retries: 12
+      delay: 10
+      changed_when: false
+
+    # Best-effort: dacă branch-ul "dev" al repo-ului de manifeste nu există
+    # încă (nimeni nu a făcut încă push pe un branch diferit de "main"),
+    # Application-ul rămâne într-o stare de eroare până la primul push CI de
+    # acolo - nu blocăm instalarea clusterului pentru asta.
+    - name: Declanșează o sincronizare imediată pentru demo-app-dev (dacă branch-ul "dev" există deja)
+      ansible.builtin.command:
+        cmd: >
+          kubectl -n argocd patch application demo-app-dev --type merge
+          -p {{ '{"operation":{"sync":{}}}' | quote }}
+      failed_when: false
+      changed_when: true
+
+    - name: Așteaptă sincronizarea Application-ului demo-app-dev (best-effort)
+      ansible.builtin.command:
+        cmd: kubectl -n argocd get application demo-app-dev -o jsonpath={.status.sync.status}
+      register: sync_status_dev
+      until: sync_status_dev.stdout == "Synced"
+      retries: 6
+      delay: 10
+      failed_when: false
+      changed_when: false

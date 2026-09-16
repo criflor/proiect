@@ -1,0 +1,34 @@
+# Adaugă rezolvarea hostname-urilor "*.kube-dev.local" cu consumatori și în
+# interiorul clusterului (pod-uri), nu doar pe mașini externe (care au
+# intrări statice /etc/hosts). Se folosește mecanismul oficial k3s de
+# extindere CoreDNS (ConfigMap "coredns-custom", fișiere *.override/*.server)
+# - NU se editează direct ConfigMap-ul "coredns", care e gestionat automat
+# de k3s.
+#
+# Plugin-ul "hosts" nu poate apărea de două ori în același bloc de server
+# (există deja unul pentru NodeHosts) - de-aia se folosește "template" pentru
+# a răspunde explicit la fiecare astfel de interogare.
+#
+# - gitlab.kube-dev.local (10.10.10.20, suport-vm): GitLab Runner, pod-urile
+#   care trag imagini din registry.
+# - keycloak.kube-dev.local (10.10.10.192, Gateway-ul din cluster): pod-ul
+#   argocd-server, la fiecare verificare a discovery URL-ului OIDC (§16) -
+#   fără el, eșuează cu "no such host" (verificat practic - CoreDNS nu are
+#   nicio noțiune despre intrările /etc/hosts scrise pe mașinile externe).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns-custom
+  namespace: kube-system
+data:
+  suport-vm.override: |
+    template IN A gitlab.kube-dev.local {
+      match "^gitlab\.kube-dev\.local\.$"
+      answer "{{ .Name }} 60 IN A 10.10.10.20"
+      fallthrough
+    }
+    template IN A keycloak.kube-dev.local {
+      match "^keycloak\.kube-dev\.local\.$"
+      answer "{{ .Name }} 60 IN A 10.10.10.192"
+      fallthrough
+    }

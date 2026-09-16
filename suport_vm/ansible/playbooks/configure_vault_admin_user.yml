@@ -1,0 +1,83 @@
+---
+# Creează userul "appadm" ca identitate de autentificare Vault (nu doar o
+# înregistrare KV, ca în configure_vault_users.yml) - user/parolă, cu
+# drepturi echivalente root-ului (acces complet, nu o policy restrânsă),
+# pentru operare curentă fără să fie nevoie de tokenul root la fiecare
+# comandă. Tokenul root și userul "root" implicit al Vault-ului NU se
+# dezactivează - rămân funcționale ca rezervă/recuperare, exact ca înainte.
+- name: Configurare user Vault "appadm" (autentificare user/parolă, drepturi de admin)
+  hosts: suport
+  become: true
+
+  vars:
+    vault_addr: "http://127.0.0.1:8201"
+    vault_user_path: secret/data/users/appadm
+
+  tasks:
+    - name: Citește tokenul root Vault
+      ansible.builtin.slurp:
+        src: "{{ vault_init_file }}"
+      register: vault_root_read
+      delegate_to: localhost
+      become: false
+
+    # Parola vine din secret/users/appadm (configure_vault_users.yml,
+    # rulat imediat înainte) - o singură sursă de adevăr pentru parola
+    # acestui user, nu una separată, generată a doua oară aici.
+    - name: Citește parola userului "appadm" din Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/{{ vault_user_path }}"
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+      register: appadm_read
+      no_log: true
+
+    - name: Verifică ce metode de autentificare sunt deja activate
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/sys/auth"
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        return_content: true
+      register: vault_auth_list
+
+    - name: Activează metoda de autentificare userpass (user/parolă)
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/sys/auth/userpass"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        body_format: json
+        body:
+          type: userpass
+        status_code: [200, 204]
+      when: "'userpass/' not in vault_auth_list.json"
+
+    # Policy cu drepturi depline (echivalent root) - "sudo" e necesar
+    # explicit pentru operațiile protejate (ex. sys/mounts, sys/policies),
+    # nu doar create/read/update/delete/list pe căi obișnuite.
+    - name: Creează policy-ul "admin" (drepturi depline, echivalent root)
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/sys/policies/acl/admin"
+        method: PUT
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        body_format: json
+        body:
+          policy: |
+            path "*" {
+              capabilities = ["create", "read", "update", "delete", "list", "sudo"]
+            }
+        status_code: [200, 204]
+
+    - name: Creează/actualizează userul "appadm" (userpass, policy "admin")
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/auth/userpass/users/appadm"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        body_format: json
+        body:
+          password: "{{ appadm_read.json.data.data.password }}"
+          token_policies: admin
+        status_code: [200, 204]
+      no_log: true

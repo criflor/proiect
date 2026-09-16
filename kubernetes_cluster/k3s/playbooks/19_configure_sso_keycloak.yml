@@ -1,0 +1,449 @@
+---
+# Configurează, în Keycloak (deja instalat de 14_install_extra_components.yml),
+# realm-ul și clienții OIDC folosiți de Vault și Argo CD ca metodă de
+# autentificare ALTERNATIVĂ (SSO) - metodele existente (Vault: token root +
+# userpass "appadm"; Argo CD: parola locală de admin) rămân neatinse, nu se
+# dezactivează nimic.
+#
+# Un singur user SSO, "ssoadm", membru al grupului "sso-admins" - Vault îl
+# leagă direct de policy-ul "admin" (echivalent root, vezi
+# suport_vm/ansible/playbooks/configure_vault_admin_user.yml), iar Argo CD
+# leagă grupul de rolul intern "role:admin" (vezi 21_configure_sso_argocd.yml).
+- name: Configurare Keycloak - realm și clienți OIDC pentru SSO
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+
+  vars:
+    kubeconfig: "{{ local_kubeconfig_path }}"
+    keycloak_hostname: keycloak.kube-dev.local
+    sso_realm: kube-dev
+    sso_group: sso-admins
+    sso_user: ssoadm
+    vault_oidc_client_path: secret/data/keycloak/vault_oidc_client
+    argocd_oidc_client_path: secret/data/keycloak/argocd_oidc_client
+    ssoadm_password_path: secret/data/sso/ssoadm_password
+    # Vault UI construiește "redirect_uri" din URL-ul curent al browser-ului
+    # (nu doar din "vault_addr", pe IP) - trebuie permise ambele adrese prin
+    # care Vault poate fi accesat, altfel autentificarea eșuează cu
+    # "Missing auth_url" pentru oricine intră pe hostname, nu pe IP
+    # (verificat practic).
+    vault_hostname_addr: "https://vault.kube-dev.local:8200"
+
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+
+  tasks:
+    - name: Citește tokenul root Vault
+      ansible.builtin.slurp:
+        src: "{{ vault_init_file }}"
+      register: vault_root_read
+
+    - name: Citește parola de admin Keycloak din Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/secret/data/keycloak/admin_password"
+        validate_certs: false
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+      register: keycloak_admin_pw_read
+      no_log: true
+
+    - name: Autentificare la API-ul de administrare Keycloak
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        validate_certs: false
+        body_format: form-urlencoded
+        body:
+          grant_type: password
+          client_id: admin-cli
+          username: admin
+          password: "{{ keycloak_admin_pw_read.json.data.data.value }}"
+        status_code: 200
+      register: keycloak_login
+      no_log: true
+
+    - name: Verifică dacă realm-ul "{{ sso_realm }}" există deja
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/admin/realms/{{ sso_realm }}"
+        validate_certs: false
+        headers:
+          Authorization: "Bearer {{ keycloak_login.json.access_token }}"
+        status_code: [200, 404]
+      register: realm_check
+
+    - name: Creează realm-ul "{{ sso_realm }}" (o singură dată)
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/admin/realms"
+        method: POST
+        validate_certs: false
+        headers:
+          Authorization: "Bearer {{ keycloak_login.json.access_token }}"
+        body_format: json
+        body:
+          realm: "{{ sso_realm }}"
+          enabled: true
+        status_code: 201
+      when: realm_check.status == 404
+
+    # Versiunile recente de Keycloak NU mai au un client scope "groups"
+    # implicit în realm-urile noi (eliminat din seed-ul standard) - fără el,
+    # cererea Argo CD de scope "groups" e respinsă cu "invalid_scope"
+    # (verificat practic). Trebuie creat manual, cu un mapper dedicat de tip
+    # "Group Membership", ca apartenența la grup să chiar ajungă ca claim în
+    # token.
+    - name: Verifică dacă client scope-ul "groups" există deja
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/admin/realms/{{ sso_realm }}/client-scopes"
+        validate_certs: false
+        headers:
+          Authorization: "Bearer {{ keycloak_login.json.access_token }}"
+        return_content: true
+      register: client_scopes_check
+
+    - name: Creează client scope-ul "groups" (o singură dată)
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/admin/realms/{{ sso_realm }}/client-scopes"
+        method: POST
+        validate_certs: false
+        headers:
+          Authorization: "Bearer {{ keycloak_login.json.access_token }}"
+        body_format: json
+        body:
+          name: groups
+          protocol: openid-connect
+          attributes:
+            "include.in.token.scope": "true"
+            "display.on.consent.screen": "false"
+        status_code: 201
+      when: client_scopes_check.json | selectattr('name', 'equalto', 'groups') | list | length == 0
+
+    - name: Re-citește client scope-urile (are nevoie de ID-ul intern al "groups")
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/admin/realms/{{ sso_realm }}/client-scopes"
+        validate_certs: false
+        headers:
+          Authorization: "Bearer {{ keycloak_login.json.access_token }}"
+        return_content: true
+      register: client_scopes_read
+
+    - name: Verifică dacă mapper-ul "Group Membership" există deja pe scope-ul "groups"
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/admin/realms/{{ sso_realm }}/client-scopes/{{ client_scopes_read.json | selectattr('name', 'equalto', 'groups') | map(attribute='id') | first }}/protocol-mappers/models"
+        validate_certs: false
+        headers:
+          Authorization: "Bearer {{ keycloak_login.json.access_token }}"
+        return_content: true
+      register: groups_mapper_check
+
+    - name: Adaugă mapper-ul "Group Membership" pe scope-ul "groups" (o singură dată)
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/admin/realms/{{ sso_realm }}/client-scopes/{{ client_scopes_read.json | selectattr('name', 'equalto', 'groups') | map(attribute='id') | first }}/protocol-mappers/models"
+        method: POST
+        validate_certs: false
+        headers:
+          Authorization: "Bearer {{ keycloak_login.json.access_token }}"
+        body_format: json
+        body:
+          name: groups
+          protocol: openid-connect
+          protocolMapper: oidc-group-membership-mapper
+          config:
+            "full.path": "false"
+            "id.token.claim": "true"
+            "access.token.claim": "true"
+            "userinfo.token.claim": "true"
+            "claim.name": groups
+        status_code: 201
+      when: groups_mapper_check.json | selectattr('name', 'equalto', 'groups') | list | length == 0
+
+    - name: Verifică dacă grupul "{{ sso_group }}" există deja
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/admin/realms/{{ sso_realm }}/groups?search={{ sso_group }}"
+        validate_certs: false
+        headers:
+          Authorization: "Bearer {{ keycloak_login.json.access_token }}"
+        return_content: true
+      register: group_check
+
+    - name: Creează grupul "{{ sso_group }}" (o singură dată)
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/admin/realms/{{ sso_realm }}/groups"
+        method: POST
+        validate_certs: false
+        headers:
+          Authorization: "Bearer {{ keycloak_login.json.access_token }}"
+        body_format: json
+        body:
+          name: "{{ sso_group }}"
+        status_code: 201
+      when: group_check.json | selectattr('name', 'equalto', sso_group) | list | length == 0
+
+    - name: Re-citește grupul (are nevoie de ID-ul intern Keycloak)
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/admin/realms/{{ sso_realm }}/groups?search={{ sso_group }}"
+        validate_certs: false
+        headers:
+          Authorization: "Bearer {{ keycloak_login.json.access_token }}"
+        return_content: true
+      register: group_read
+
+    # Clienți OIDC "confidențiali" (au client_secret) - Vault și Argo CD
+    # validează identitatea prin fluxul standard "Authorization Code".
+    - name: Verifică dacă clientul "vault" există deja
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/admin/realms/{{ sso_realm }}/clients?clientId=vault"
+        validate_certs: false
+        headers:
+          Authorization: "Bearer {{ keycloak_login.json.access_token }}"
+        return_content: true
+      register: vault_client_check
+
+    - name: Creează clientul OIDC "vault" (o singură dată)
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/admin/realms/{{ sso_realm }}/clients"
+        method: POST
+        validate_certs: false
+        headers:
+          Authorization: "Bearer {{ keycloak_login.json.access_token }}"
+        body_format: json
+        body:
+          clientId: vault
+          protocol: openid-connect
+          publicClient: false
+          standardFlowEnabled: true
+          serviceAccountsEnabled: false
+          redirectUris:
+            - "{{ vault_addr }}/ui/vault/auth/oidc/oidc/callback"
+            - "http://localhost:8250/oidc/callback"
+          webOrigins:
+            - "+"
+        status_code: 201
+      when: vault_client_check.json | length == 0
+
+    - name: Verifică dacă clientul "argocd" există deja
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/admin/realms/{{ sso_realm }}/clients?clientId=argocd"
+        validate_certs: false
+        headers:
+          Authorization: "Bearer {{ keycloak_login.json.access_token }}"
+        return_content: true
+      register: argocd_client_check
+
+    - name: Creează clientul OIDC "argocd" (o singură dată)
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/admin/realms/{{ sso_realm }}/clients"
+        method: POST
+        validate_certs: false
+        headers:
+          Authorization: "Bearer {{ keycloak_login.json.access_token }}"
+        body_format: json
+        body:
+          clientId: argocd
+          protocol: openid-connect
+          publicClient: false
+          standardFlowEnabled: true
+          serviceAccountsEnabled: false
+          redirectUris:
+            - "https://argocd.kube-dev.local/auth/callback"
+          webOrigins:
+            - "+"
+        status_code: 201
+      when: argocd_client_check.json | length == 0
+
+    # Re-citite necondiționat (nu doar "o singură dată") - avem nevoie de
+    # ID-ul intern Keycloak al fiecărui client, indiferent dacă tocmai a
+    # fost creat sau exista deja dintr-o rulare anterioară.
+    - name: Citește ID-ul intern al clientului "vault"
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/admin/realms/{{ sso_realm }}/clients?clientId=vault"
+        validate_certs: false
+        headers:
+          Authorization: "Bearer {{ keycloak_login.json.access_token }}"
+        return_content: true
+      register: vault_client_read
+
+    # Necondiționat (nu doar "o singură dată", ca la creare) - task-ul de
+    # creare de mai sus rulează doar când clientul nu există deja, deci nu
+    # ar mai actualiza niciodată lista de redirect URI-uri permise pe un
+    # client deja creat într-o rulare anterioară.
+    - name: Actualizează "redirectUris" ale clientului "vault" (IP + hostname)
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/admin/realms/{{ sso_realm }}/clients/{{ vault_client_read.json[0].id }}"
+        method: PUT
+        validate_certs: false
+        headers:
+          Authorization: "Bearer {{ keycloak_login.json.access_token }}"
+        body_format: json
+        body:
+          redirectUris:
+            - "{{ vault_addr }}/ui/vault/auth/oidc/oidc/callback"
+            - "{{ vault_hostname_addr }}/ui/vault/auth/oidc/oidc/callback"
+            - "http://localhost:8250/oidc/callback"
+        status_code: 204
+
+    - name: Citește ID-ul intern al clientului "argocd"
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/admin/realms/{{ sso_realm }}/clients?clientId=argocd"
+        validate_certs: false
+        headers:
+          Authorization: "Bearer {{ keycloak_login.json.access_token }}"
+        return_content: true
+      register: argocd_client_read
+
+    # Argo CD cere explicit scope-ul "groups" (vezi requestedScopes din
+    # 21_configure_sso_argocd.yml) - fără atribuirea asta, clientul nu-l
+    # primește deloc, indiferent că scope-ul există la nivel de realm.
+    # Idempotent la nivel HTTP: PUT peste o atribuire deja existentă
+    # răspunde tot 204, fără eroare.
+    - name: Atribuie scope-ul "groups" ca implicit clientului "argocd"
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/admin/realms/{{ sso_realm }}/clients/{{ argocd_client_read.json[0].id }}/default-client-scopes/{{ client_scopes_read.json | selectattr('name', 'equalto', 'groups') | map(attribute='id') | first }}"
+        method: PUT
+        validate_certs: false
+        headers:
+          Authorization: "Bearer {{ keycloak_login.json.access_token }}"
+        status_code: 204
+
+    - name: Citește secretul generat automat al clientului "vault"
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/admin/realms/{{ sso_realm }}/clients/{{ vault_client_read.json[0].id }}/client-secret"
+        validate_certs: false
+        headers:
+          Authorization: "Bearer {{ keycloak_login.json.access_token }}"
+      register: vault_client_secret_read
+      no_log: true
+
+    - name: Citește secretul generat automat al clientului "argocd"
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/admin/realms/{{ sso_realm }}/clients/{{ argocd_client_read.json[0].id }}/client-secret"
+        validate_certs: false
+        headers:
+          Authorization: "Bearer {{ keycloak_login.json.access_token }}"
+      register: argocd_client_secret_read
+      no_log: true
+
+    - name: Scrie credențialele clientului OIDC "vault" în Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/{{ vault_oidc_client_path }}"
+        validate_certs: false
+        method: POST
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        body_format: json
+        body:
+          data:
+            client_id: vault
+            client_secret: "{{ vault_client_secret_read.json.value }}"
+        status_code: 200
+      no_log: true
+
+    - name: Scrie credențialele clientului OIDC "argocd" în Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/{{ argocd_oidc_client_path }}"
+        validate_certs: false
+        method: POST
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        body_format: json
+        body:
+          data:
+            client_id: argocd
+            client_secret: "{{ argocd_client_secret_read.json.value }}"
+        status_code: 200
+      no_log: true
+
+    - name: Verifică dacă userul "{{ sso_user }}" există deja
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/admin/realms/{{ sso_realm }}/users?username={{ sso_user }}"
+        validate_certs: false
+        headers:
+          Authorization: "Bearer {{ keycloak_login.json.access_token }}"
+        return_content: true
+      register: ssoadm_check
+
+    - name: Creează userul "{{ sso_user }}" (o singură dată)
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/admin/realms/{{ sso_realm }}/users"
+        method: POST
+        validate_certs: false
+        headers:
+          Authorization: "Bearer {{ keycloak_login.json.access_token }}"
+        body_format: json
+        body:
+          username: "{{ sso_user }}"
+          email: "{{ sso_user }}@kube-dev.local"
+          emailVerified: true
+          enabled: true
+          firstName: SSO
+          lastName: Admin
+        status_code: 201
+      when: ssoadm_check.json | length == 0
+
+    - name: Re-citește userul (are nevoie de ID-ul intern Keycloak)
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/admin/realms/{{ sso_realm }}/users?username={{ sso_user }}"
+        validate_certs: false
+        headers:
+          Authorization: "Bearer {{ keycloak_login.json.access_token }}"
+        return_content: true
+      register: ssoadm_read
+
+    - name: Adaugă "{{ sso_user }}" în grupul "{{ sso_group }}" (idempotent)
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/admin/realms/{{ sso_realm }}/users/{{ ssoadm_read.json[0].id }}/groups/{{ group_read.json[0].id }}"
+        method: PUT
+        validate_certs: false
+        headers:
+          Authorization: "Bearer {{ keycloak_login.json.access_token }}"
+        status_code: 204
+
+    - name: Verifică dacă parola "{{ sso_user }}" există deja în Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/{{ ssoadm_password_path }}"
+        validate_certs: false
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        status_code: [200, 404]
+      register: ssoadm_pw_check
+
+    - name: Generează parola "{{ sso_user }}" (doar dacă lipsește din Vault)
+      ansible.builtin.command:
+        cmd: openssl rand -base64 20
+      register: ssoadm_pw_gen
+      when: ssoadm_pw_check.status == 404
+
+    # Parola se setează în Keycloak DOAR când tocmai a fost generată -
+    # altfel, la fiecare rulare ulterioară, am suprascrie o parolă deja
+    # eventual schimbată manual de userul SSO.
+    - name: Setează parola "{{ sso_user }}" în Keycloak (o singură dată)
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_hostname }}/admin/realms/{{ sso_realm }}/users/{{ ssoadm_read.json[0].id }}/reset-password"
+        method: PUT
+        validate_certs: false
+        headers:
+          Authorization: "Bearer {{ keycloak_login.json.access_token }}"
+        body_format: json
+        body:
+          type: password
+          value: "{{ ssoadm_pw_gen.stdout }}"
+          temporary: false
+        status_code: 204
+      when: ssoadm_pw_gen is not skipped
+      no_log: true
+
+    - name: Scrie parola "{{ sso_user }}" în Vault (o singură dată)
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/{{ ssoadm_password_path }}"
+        validate_certs: false
+        method: POST
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        body_format: json
+        body:
+          data:
+            value: "{{ ssoadm_pw_gen.stdout }}"
+        status_code: 200
+      when: ssoadm_pw_gen is not skipped
+      no_log: true

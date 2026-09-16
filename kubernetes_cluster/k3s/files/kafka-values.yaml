@@ -1,0 +1,66 @@
+# Imaginile din namespace-ul "bitnami/" nu mai au tag-uri publicate pe Docker
+# Hub (migrate spre catalogul plătit "Bitnami Secure Images") - tag-urile mai
+# vechi, gratuite, rămân disponibile doar sub "bitnamilegacy/".
+image:
+  repository: bitnamilegacy/kafka
+
+# Kafka în mod KRaft (fără ZooKeeper - eliminat din chart-ul curent), un
+# singur nod combinat controller+broker. Instanță unică (nu 3, cum e implicit
+# în chart) - decizie confirmată: fără resurse pentru un cluster Kafka real
+# la scara acestui exercițiu.
+controller:
+  replicaCount: 1
+  persistence:
+    enabled: true
+    storageClass: local-path
+    size: 2Gi
+  resources:
+    requests:
+      cpu: 100m
+      memory: 512Mi
+    limits:
+      cpu: 500m
+      memory: 768Mi
+  # JVM implicit alocă mult mai multă memorie decât are nevoie o instanță de
+  # test - limitat explicit ca să încapă în resursele nodurilor.
+  extraEnvVars:
+    - name: KAFKA_HEAP_OPTS
+      value: "-Xmx384m -Xms256m"
+
+broker:
+  replicaCount: 0
+
+# Implicit, Kafka cere factor de replicare 3 pentru topicul intern
+# "__consumer_offsets" - imposibil de satisfăcut cu un singur broker. Fără
+# acest topic, NICIUN consumator nu se poate înregistra într-un grup (eșec
+# silențios, fără nicio eroare vizibilă) - verificat practic, vezi
+# documentația, secțiunea "Probleme întâlnite".
+overrideConfiguration:
+  offsets.topic.replication.factor: "1"
+  transaction.state.log.replication.factor: "1"
+  transaction.state.log.min.isr: "1"
+
+listeners:
+  client:
+    protocol: PLAINTEXT
+
+# Expune metricile Kafka (JMX) pentru colectorul OTel din cluster (cerința
+# 10 - monitorizare) - sidecar suplimentar, dar cu resurse strict limitate.
+# Imaginea exportorului JMX are aceeași problemă de migrare Bitnami ca și
+# imaginea principală (vezi documentația) - fixată la fel.
+metrics:
+  kafka:
+    enabled: false
+  jmx:
+    enabled: true
+    image:
+      repository: bitnamilegacy/jmx-exporter
+    resources:
+      requests:
+        cpu: 20m
+        memory: 64Mi
+      limits:
+        cpu: 100m
+        memory: 128Mi
+networkPolicy:
+  enabled: false

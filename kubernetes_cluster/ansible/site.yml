@@ -1,0 +1,4 @@
+---
+- import_playbook: playbooks/create_admin_user.yml
+- import_playbook: playbooks/update_system.yml
+- import_playbook: playbooks/install_nfs_client.yml

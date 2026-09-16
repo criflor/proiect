@@ -1,0 +1,83 @@
+---
+# Instalează k3s în topologie HA simetrică: TOATE nodurile rulează server
+# (control-plane, cu etcd distribuit, embedded) ȘI workload-uri obișnuite -
+# niciun nod dedicat exclusiv unui singur rol ("agent"). Primul nod din
+# grupul k3s_server inițializează clusterul (--cluster-init, pornește
+# etcd-ul distribuit); restul nodurilor se alătură ca servere suplimentare
+# (--server + token), nu ca agenți. Flag-urile necesare ca Cilium să preia
+# complet rețeaua (fără flannel, fără kube-proxy) și expunerea externă
+# (fără servicelb/traefik) sunt identice pe toate nodurile.
+# Idempotent: scriptul oficial k3s detectă instalarea existentă și nu o reface.
+- name: Instalare k3s - primul nod (inițializare cluster HA)
+  hosts: "{{ groups['k3s_server'][0] }}"
+  become: true
+
+  tasks:
+    - name: Instalează k3s server (inițializare cluster, canal stable)
+      ansible.builtin.shell: |
+        curl -sfL https://get.k3s.io | \
+          INSTALL_K3S_CHANNEL=stable \
+          INSTALL_K3S_EXEC="server \
+            --cluster-init \
+            --cluster-cidr={{ k3s_cluster_cidr }} \
+            --service-cidr={{ k3s_service_cidr }} \
+            --flannel-backend=none \
+            --disable-network-policy \
+            --disable-kube-proxy \
+            --disable=servicelb \
+            --disable=traefik \
+            --write-kubeconfig-mode=644 \
+            --tls-san={{ ansible_host }}" \
+          sh -
+      args:
+        creates: /usr/local/bin/k3s
+
+    - name: Așteaptă ca API server-ul să răspundă
+      ansible.builtin.wait_for:
+        port: 6443
+        timeout: 120
+
+    - name: Citește token-ul de join generat de server
+      ansible.builtin.slurp:
+        src: /var/lib/rancher/k3s/server/node-token
+      register: k3s_token_raw
+
+    - name: Salvează token-ul ca fapt (folosit de play-ul pentru celelalte noduri, mai jos)
+      ansible.builtin.set_fact:
+        k3s_node_token: "{{ k3s_token_raw.content | b64decode | trim }}"
+
+- name: Instalare k3s - restul nodurilor (se alătură ca servere suplimentare)
+  hosts: k3s_server
+  become: true
+
+  vars:
+    k3s_first_server_ip: "{{ hostvars[groups['k3s_server'][0]].ansible_host }}"
+    k3s_join_token: "{{ hostvars[groups['k3s_server'][0]].k3s_node_token }}"
+
+  tasks:
+    - name: Instalează k3s server suplimentar (se alătură clusterului HA)
+      ansible.builtin.shell: |
+        curl -sfL https://get.k3s.io | \
+          INSTALL_K3S_CHANNEL=stable \
+          INSTALL_K3S_EXEC="server \
+            --server https://{{ k3s_first_server_ip }}:6443 \
+            --cluster-cidr={{ k3s_cluster_cidr }} \
+            --service-cidr={{ k3s_service_cidr }} \
+            --flannel-backend=none \
+            --disable-network-policy \
+            --disable-kube-proxy \
+            --disable=servicelb \
+            --disable=traefik \
+            --write-kubeconfig-mode=644 \
+            --tls-san={{ ansible_host }}" \
+          K3S_TOKEN="{{ k3s_join_token }}" \
+          sh -
+      args:
+        creates: /usr/local/bin/k3s
+      when: inventory_hostname != groups['k3s_server'][0]
+
+    - name: Așteaptă ca API server-ul local să răspundă
+      ansible.builtin.wait_for:
+        port: 6443
+        timeout: 120
+      when: inventory_hostname != groups['k3s_server'][0]

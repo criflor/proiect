@@ -1,0 +1,20 @@
+# Expune Hubble UI (deja instalat, vezi cilium-values.yaml) permanent prin
+# Gateway-ul clusterului, în loc de kubectl port-forward ad-hoc.
+# Ruta stă în namespace-ul kube-system, alături de serviciul hubble-ui, ca să
+# nu fie nevoie de un ReferenceGrant pentru un backendRef cross-namespace.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: hubble-ui
+  namespace: kube-system
+spec:
+  parentRefs:
+    - name: kube-dev-gateway
+      namespace: gateway
+      sectionName: https
+  hostnames:
+    - "hubble.kube-dev.local"
+  rules:
+    - backendRefs:
+        - name: hubble-ui
+          port: 80

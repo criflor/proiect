@@ -1,0 +1,229 @@
+---
+# Instalează HashiCorp Vault pe VM-ul de suport, prin pachetul oficial APT
+# (repo HashiCorp) - aceeași abordare ca la Docker (install_docker.yml):
+# repo oficial, nu binar descărcat manual. Fără disc LVM dedicat - datele
+# Vault (chei criptate, nu blob-uri mari ca la GitLab/NFS/SigNoz) rămân pe
+# discul de sistem, sub /opt/vault.
+- name: Instalare HashiCorp Vault
+  hosts: suport
+  become: true
+
+  vars:
+    vault_data_dir: /opt/vault/data
+    vault_config_dir: /etc/vault.d
+    # Adresa folosită de ACEST playbook (și de configure_vault_pki.yml) - un
+    # listener SEPARAT, doar loopback, mereu HTTP, dedicat exclusiv
+    # bootstrap-ului Vault (init/unseal/administrare) rulat de pe host chiar
+    # de acest server. Nu poate depinde de certificatul propriu al Vault-ului
+    # (§13 din documentație) - la prima pornire acel certificat nu există
+    # încă, e nevoie ca Vault să fie deja funcțional ca să-l poată emite.
+    # Traficul nu iese niciodată din kernel (127.0.0.1), deci nu are nevoie
+    # de TLS - alte playbook-uri, care NU rulează pe acest host, folosesc
+    # adresa externă (`vault_addr` din group_vars, HTTPS după §13).
+    vault_addr: "http://127.0.0.1:8201"
+
+  tasks:
+    - name: Verifică dacă Vault e deja instalat
+      ansible.builtin.command:
+        cmd: vault --version
+      register: vault_check
+      failed_when: false
+      changed_when: false
+
+    - name: Instalează pachetele necesare pentru adăugarea repo-ului APT
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+        state: present
+        update_cache: true
+      when: vault_check.rc != 0
+
+    - name: Creează directorul pentru cheia GPG a repo-ului HashiCorp
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+      when: vault_check.rc != 0
+
+    - name: Descarcă cheia GPG oficială HashiCorp
+      ansible.builtin.get_url:
+        url: https://apt.releases.hashicorp.com/gpg
+        dest: /etc/apt/keyrings/hashicorp.asc
+        mode: "0644"
+      when: vault_check.rc != 0
+
+    - name: Adaugă repo-ul APT oficial HashiCorp
+      ansible.builtin.apt_repository:
+        repo: >-
+          deb [arch=amd64 signed-by=/etc/apt/keyrings/hashicorp.asc]
+          https://apt.releases.hashicorp.com {{ ansible_distribution_release }} main
+        state: present
+        filename: hashicorp
+      when: vault_check.rc != 0
+
+    - name: Instalează Vault
+      ansible.builtin.apt:
+        name: vault
+        state: present
+        update_cache: true
+      when: vault_check.rc != 0
+
+    - name: Creează directorul de date Vault
+      ansible.builtin.file:
+        path: "{{ vault_data_dir }}"
+        state: directory
+        owner: vault
+        group: vault
+        mode: "0750"
+
+    - name: Verifică dacă Vault are deja propriul certificat (emis din propriul PKI, §13)
+      ansible.builtin.stat:
+        path: "{{ vault_config_dir }}/vault.crt"
+      register: vault_own_cert_check
+
+    # Listener-ul extern (0.0.0.0:8200) pornește fără TLS (nu are cum să
+    # aibă un certificat înainte ca Vault să fie măcar funcțional) și devine
+    # HTTPS abia după ce configure_vault_pki.yml îi emite un certificat din
+    # propria intermediată - acest task se adaptează automat, pe baza
+    # simplei existențe a fișierului de certificat, fără nicio detectare mai
+    # complexă a stării curente.
+    - name: Configurează Vault (storage local, listener intern de bootstrap + listener extern)
+      ansible.builtin.copy:
+        content: |
+          ui = true
+          disable_mlock = true
+
+          storage "file" {
+            path = "{{ vault_data_dir }}"
+          }
+
+          # Doar loopback, mereu HTTP - vezi comentariul de la "vault_addr" de mai sus.
+          listener "tcp" {
+            address     = "127.0.0.1:8201"
+            tls_disable = true
+          }
+
+          listener "tcp" {
+            address     = "0.0.0.0:8200"
+          {% if vault_own_cert_check.stat.exists %}
+            tls_cert_file = "{{ vault_config_dir }}/vault.crt"
+            tls_key_file  = "{{ vault_config_dir }}/vault.key"
+          {% else %}
+            tls_disable = true
+          {% endif %}
+          }
+
+          api_addr = "{{ 'https' if vault_own_cert_check.stat.exists else 'http' }}://10.10.10.20:8200"
+        dest: "{{ vault_config_dir }}/vault.hcl"
+        owner: vault
+        group: vault
+        mode: "0640"
+      register: vault_config
+
+    - name: Pornește și activează serviciul Vault
+      ansible.builtin.systemd:
+        name: vault
+        state: started
+        enabled: true
+        daemon_reload: true
+
+    - name: Repornește Vault dacă s-a schimbat configurația
+      ansible.builtin.systemd:
+        name: vault
+        state: restarted
+      when: vault_config.changed
+
+    - name: Așteaptă ca Vault să răspundă
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/sys/health"
+        status_code: [200, 429, 472, 473, 501, 503]
+      register: vault_health
+      until: vault_health.status is defined
+      retries: 15
+      delay: 4
+
+    - name: Verifică starea de inițializare Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/sys/init"
+        return_content: true
+      register: vault_init_check
+      environment:
+        VAULT_ADDR: "{{ vault_addr }}"
+
+    # O singură cheie de unseal (key-shares=1, threshold=1) - decizie
+    # asumată pentru scara acestui exercițiu (fără cvorum HA real, aceeași
+    # logică ca la Kafka/Redis/Keycloak, §9.1 din documentație). Token-ul
+    # root și cheia de unseal nu intră NICIODATĂ în git.
+    - name: Inițializează Vault (o singură dată)
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/sys/init"
+        method: PUT
+        body_format: json
+        body:
+          secret_shares: 1
+          secret_threshold: 1
+        return_content: true
+      register: vault_init
+      when: not vault_init_check.json.initialized
+
+    - name: Salvează cheia de unseal și token-ul root (nu intră în git)
+      ansible.builtin.copy:
+        content: "{{ vault_init.json | to_nice_json }}"
+        dest: "{{ playbook_dir }}/../../.vault_init.json"
+        mode: "0600"
+      delegate_to: localhost
+      become: false
+      when: not vault_init_check.json.initialized
+
+    - name: Citește cheia de unseal salvată (din fișier, la fiecare rulare)
+      ansible.builtin.slurp:
+        src: "{{ playbook_dir }}/../../.vault_init.json"
+      register: vault_init_read
+      delegate_to: localhost
+      become: false
+
+    - name: Verifică dacă Vault e sigilat (sealed)
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/sys/seal-status"
+        return_content: true
+      register: vault_seal_status
+
+    # Vault pornește mereu sigilat după un restart/reboot (backend-ul "file"
+    # nu suportă auto-unseal) - fără acest pas, serviciul rămâne inutilizabil
+    # după fiecare repornire a VM-ului de suport.
+    - name: Desigilează (unseal) Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/sys/unseal"
+        method: PUT
+        body_format: json
+        body:
+          key: "{{ (vault_init_read.content | b64decode | from_json)['keys'][0] }}"
+        status_code: 200
+      when: vault_seal_status.json.sealed
+
+    # De aici încolo, Vault e singurul loc unde există secrete ale acestui
+    # proiect (parole, token-uri) - toate celelalte playbook-uri generează
+    # secretul (dacă lipsește), îl scriu aici (KV v2) și îl citesc de aici la
+    # nevoie, fără niciun fișier local intermediar (excepția fiind chiar acest
+    # fișier, .vault_init.json - rădăcina de încredere care desigilează Vault-ul).
+    - name: Verifică ce motoare de secrete sunt deja activate
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/sys/mounts"
+        headers:
+          X-Vault-Token: "{{ (vault_init_read.content | b64decode | from_json).root_token }}"
+        return_content: true
+      register: vault_mounts
+
+    - name: Activează motorul KV v2 la calea "secret/" (o singură dată)
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/sys/mounts/secret"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ (vault_init_read.content | b64decode | from_json).root_token }}"
+        body_format: json
+        body:
+          type: kv-v2
+        status_code: 204
+      when: "'secret/' not in vault_mounts.json"

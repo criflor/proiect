@@ -1,0 +1,76 @@
+---
+# Instalează GitLab Runner în clusterul k3s (executor Kubernetes) - job-urile
+# CI/CD (inclusiv build-ul de imagini cu Kaniko) rulează ca pod-uri efemere,
+# nu pe o mașină dedicată.
+- name: Instalare GitLab Runner (executor Kubernetes)
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+
+  vars:
+    kubeconfig: "{{ local_kubeconfig_path }}"
+    vault_runner_token_path: secret/data/gitlab/runner_token
+    gitlab_ca_file: "{{ playbook_dir }}/../files/gitlab-kube-dev-local-ca.crt"
+
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+
+  tasks:
+    - name: Creează namespace-ul gitlab-runner
+      ansible.builtin.command:
+        cmd: kubectl create namespace gitlab-runner
+      register: ns_create
+      failed_when: ns_create.rc != 0 and 'AlreadyExists' not in ns_create.stderr
+      changed_when: ns_create.rc == 0
+
+    - name: Citește tokenul root Vault
+      ansible.builtin.slurp:
+        src: "{{ vault_init_file }}"
+      register: vault_root_read
+
+    - name: Citește token-ul de autentificare al runner-ului din Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/{{ vault_runner_token_path }}"
+        validate_certs: false
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+      register: runner_token_read
+      no_log: true
+
+    - name: Creează/actualizează secretul cu certificatul CA al GitLab (pentru runner și pod-urile de job/Kaniko)
+      ansible.builtin.command:
+        cmd: >
+          kubectl -n gitlab-runner create secret generic gitlab-runner-certs
+          --from-file=gitlab.kube-dev.local.crt={{ gitlab_ca_file }}
+          --dry-run=client -o yaml
+      register: cert_secret_yaml
+      changed_when: false
+
+    - name: Aplică secretul cu certificatul CA
+      ansible.builtin.shell:
+        cmd: "echo {{ cert_secret_yaml.stdout | quote }} | kubectl apply -f -"
+      register: cert_secret_apply
+      changed_when: "'unchanged' not in cert_secret_apply.stdout"
+
+    - name: Adaugă/actualizează repo-ul Helm al GitLab Runner
+      ansible.builtin.command:
+        cmd: helm repo add gitlab https://charts.gitlab.io
+      register: helm_repo_add
+      changed_when: "'has been added' in helm_repo_add.stdout"
+
+    - name: Instalează/actualizează GitLab Runner via Helm
+      ansible.builtin.command:
+        cmd: >
+          helm upgrade --install gitlab-runner gitlab/gitlab-runner
+          --namespace gitlab-runner
+          --values {{ playbook_dir }}/../files/gitlab-runner-values.yaml
+          --set runnerToken={{ runner_token_read.json.data.data.value }}
+      register: runner_helm
+      changed_when: "'has been upgraded' in runner_helm.stdout or 'has been installed' in runner_helm.stdout"
+      no_log: true
+
+    - name: Așteaptă ca runner-ul să fie disponibil
+      ansible.builtin.command:
+        cmd: kubectl -n gitlab-runner rollout status deployment/gitlab-runner --timeout=120s
+      changed_when: false

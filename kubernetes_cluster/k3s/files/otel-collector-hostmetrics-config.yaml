@@ -1,0 +1,92 @@
+receivers:
+  # Metrici reale de utilizare hardware pe FIECARE nod (CPU, memorie, disc,
+  # rețea) - lipseau complet din colectorul-gateway (acela citește doar
+  # STAREA obiectelor Kubernetes, nu utilizarea efectivă a resurselor).
+  hostmetrics:
+    collection_interval: 30s
+    # Fără "root_path", scraperele citesc /proc, /sys și mount-urile din
+    # interiorul CONTAINERULUI (propriul rootfs, izolat) - nu de pe nodul
+    # real. Rezultatul practic: "system.filesystem.usage" lipsea complet din
+    # SigNoz ("Missing default metrics", panoul Infrastructure), deși
+    # scraper-ul "filesystem" era activat - vezi hostPath-ul "hostfs" montat
+    # la /hostfs în DaemonSet, mai jos.
+    root_path: /hostfs
+    scrapers:
+      cpu: {}
+      memory: {}
+      disk: {}
+      filesystem: {}
+      network: {}
+      load: {}
+
+  # Metrici de utilizare per pod/container, citite direct de la kubelet-ul
+  # local al fiecărui nod (nu prin API server) - necesare pentru secțiunea
+  # "Hosts"/"Infrastructure" din SigNoz.
+  kubeletstats:
+    collection_interval: 30s
+    auth_type: serviceAccount
+    endpoint: "https://${env:K8S_NODE_NAME}:10250"
+    insecure_skip_verify: true
+    metric_groups: [node, pod, container]
+
+  # Loguri de container - lipseau complet (nicio pipeline de logs nu era
+  # configurată, secțiunea "Logs" din SigNoz era goală). Citește direct
+  # fișierele de pe disc (format CRI, standard pentru containerd/k3s), nu
+  # prin API server - de aceea acest DaemonSet are nevoie de acces la
+  # /var/log/pods de pe nodul propriu.
+  filelog:
+    include: [/var/log/pods/*/*/*.log]
+    start_at: beginning
+    include_file_path: true
+    include_file_name: false
+    operators:
+      - type: container
+        format: containerd
+
+processors:
+  batch: {}
+  resource:
+    attributes:
+      - key: k8s.cluster.name
+        value: kube-dev
+        action: upsert
+      - key: k8s.node.name
+        value: "${env:K8S_NODE_NAME}"
+        action: upsert
+      # Secțiunea "Hosts" din SigNoz se bazează pe această etichetă specifică
+      # (convenție semantică OTel) - lipsea complet, deși hostmetrics/
+      # kubeletstats raportau corect sub "k8s.node.name" (verificat practic).
+      - key: host.name
+        value: "${env:K8S_NODE_NAME}"
+        action: upsert
+
+  # Îmbogățește logurile cu metadate despre pod (namespace, labels) - extrase
+  # din calea fișierului, nu necesită un query separat la API server pentru
+  # fiecare linie de log.
+  k8sattributes:
+    filter:
+      node_from_env_var: K8S_NODE_NAME
+    extract:
+      metadata:
+        - k8s.pod.name
+        - k8s.namespace.name
+        - k8s.container.name
+
+exporters:
+  # TLS, ca la colectorul-gateway (otel-collector-config.yaml) - rădăcina
+  # PKI comună, montată din același ConfigMap "otel-collector-ca".
+  otlp:
+    endpoint: 10.10.10.20:4317
+    tls:
+      ca_file: /etc/otel-ca/ca.crt
+
+service:
+  pipelines:
+    metrics:
+      receivers: [hostmetrics, kubeletstats]
+      processors: [resource, batch]
+      exporters: [otlp]
+    logs:
+      receivers: [filelog]
+      processors: [k8sattributes, resource, batch]
+      exporters: [otlp]

@@ -1,0 +1,188 @@
+---
+# Configurează autentificarea Kubernetes a Vault-ului (cerința de securitate:
+# cert-manager obține certificate din Vault PKI - vezi
+# suport_vm/ansible/playbooks/configure_vault_pki.yml - fără niciun token
+# Vault static/permanent de gestionat manual). Deși numerotat 16 (adăugat
+# ulterior), trebuie rulat imediat după "04_install_cert_manager.yml" (are
+# nevoie de namespace-ul și ServiceAccount-ul "cert-manager", deja create de
+# acela) - vezi ordinea de import din site.yml, nu numele fișierului.
+#
+# Tipar: Vault validează (TokenReview, prin API-ul Kubernetes) JWT-ul propriu
+# al ServiceAccount-ului "cert-manager" la fiecare cerere de certificat - fără
+# token Vault static, doar o identitate Kubernetes deja existentă.
+- name: Configurare autentificare Kubernetes pentru Vault (PKI)
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+
+  vars:
+    kubeconfig: "{{ local_kubeconfig_path }}"
+    cert_manager_namespace: cert-manager
+    cert_manager_service_account: cert-manager
+    vault_role_name: cert-manager
+    root_ca_file: "{{ playbook_dir }}/../files/gitlab-kube-dev-local-ca.crt"
+
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+
+  tasks:
+    - name: Aplică ServiceAccount-ul și ClusterRoleBinding-ul folosite de Vault pentru TokenReview
+      ansible.builtin.command:
+        cmd: kubectl apply -f {{ playbook_dir }}/../files/vault-kubernetes-auth-rbac.yaml
+      register: vault_auth_rbac_apply
+      changed_when: "'unchanged' not in vault_auth_rbac_apply.stdout"
+
+    - name: Citește tokenul root Vault
+      ansible.builtin.slurp:
+        src: "{{ vault_init_file }}"
+      register: vault_root_read
+
+    # Token de lungă durată pentru identitatea "reviewer" - o singură dată
+    # (nu se regenerează la fiecare rulare, ar invalida tokenul deja
+    # configurat în Vault fără niciun beneficiu real).
+    - name: Verifică dacă autentificarea Kubernetes e deja configurată în Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/sys/auth"
+        validate_certs: false
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        return_content: true
+      register: vault_auth_list
+
+    - name: Activează metoda de autentificare Kubernetes în Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/sys/auth/kubernetes"
+        validate_certs: false
+        method: POST
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        body_format: json
+        body:
+          type: kubernetes
+        status_code: [200, 204]
+      when: "'kubernetes/' not in vault_auth_list.json"
+
+    - name: Generează tokenul identității "reviewer" (vault-auth)
+      ansible.builtin.command:
+        cmd: kubectl create token vault-auth -n kube-system --duration=87600h
+      register: reviewer_token_gen
+      changed_when: false
+      no_log: true
+
+    - name: Obține certificatul CA al API-ului Kubernetes
+      ansible.builtin.command:
+        cmd: >
+          kubectl config view --raw --minify
+          -o jsonpath={.clusters[0].cluster.certificate-authority-data}
+      register: k8s_ca_b64
+      changed_when: false
+
+    - name: Obține adresa API-ului Kubernetes
+      ansible.builtin.command:
+        cmd: kubectl config view --raw --minify -o jsonpath={.clusters[0].cluster.server}
+      register: k8s_api_url
+      changed_when: false
+
+    # Idempotent necondiționat (nu doar "o singură dată") - tokenul de
+    # reviewer de mai sus e mereu proaspăt regenerat, deci configurația
+    # trebuie rescrisă de fiecare dată ca să rămână validă.
+    - name: Configurează autentificarea Kubernetes în Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/auth/kubernetes/config"
+        validate_certs: false
+        method: POST
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        body_format: json
+        body:
+          kubernetes_host: "{{ k8s_api_url.stdout }}"
+          kubernetes_ca_cert: "{{ k8s_ca_b64.stdout | b64decode }}"
+          token_reviewer_jwt: "{{ reviewer_token_gen.stdout }}"
+        status_code: [200, 204]
+      no_log: true
+
+    # Leagă STRICT ServiceAccount-ul "cert-manager" (namespace-ul lui) de
+    # policy-ul care permite DOAR emiterea de certificate (cert-manager-pki,
+    # vezi configure_vault_pki.yml) - nicio altă identitate Kubernetes nu
+    # poate folosi acest rol.
+    - name: Creează/actualizează rolul Vault "{{ vault_role_name }}"
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/auth/kubernetes/role/{{ vault_role_name }}"
+        validate_certs: false
+        method: POST
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        body_format: json
+        body:
+          bound_service_account_names: "{{ cert_manager_service_account }}"
+          bound_service_account_namespaces: "{{ cert_manager_namespace }}"
+          token_policies: cert-manager-pki
+          ttl: 20m
+        status_code: [200, 204]
+
+    # Tokenul propriu al ServiceAccount-ului "cert-manager" - identitatea cu
+    # care cert-manager se autentifică efectiv la Vault (via Issuer-ul Vault
+    # din cluster-issuer.yaml), nu tokenul de reviewer de mai sus.
+    - name: Generează tokenul ServiceAccount-ului cert-manager
+      ansible.builtin.command:
+        cmd: >
+          kubectl create token {{ cert_manager_service_account }}
+          -n {{ cert_manager_namespace }} --duration=87600h
+      register: cert_manager_token_gen
+      changed_when: false
+      no_log: true
+
+    - name: Creează/actualizează Secret-ul cu tokenul cert-manager (pentru Issuer-ul Vault)
+      ansible.builtin.shell:
+        cmd: >
+          kubectl -n {{ cert_manager_namespace }} create secret generic cert-manager-vault-token
+          --from-literal=token={{ cert_manager_token_gen.stdout | quote }}
+          --dry-run=client -o yaml | kubectl apply -f -
+      register: cert_manager_token_secret_apply
+      changed_when: "'unchanged' not in cert_manager_token_secret_apply.stdout"
+      no_log: true
+
+    # Rescrie ClusterIssuer-ul (deja aplicat, fără succes, de
+    # 04_install_cert_manager.yml, cu server HTTP și fără caBundle - acolo
+    # Vault încă nu are HTTPS/rol/policy configurate) - abia acum poate
+    # emite cu adevărat certificate. Injectat inline (nu fișierul static
+    # `files/cluster-issuer.yaml`) fiindcă are nevoie de rădăcina Vault
+    # (`root_ca_file`, deja sincronizată de configure_vault_pki.yml) ca
+    # `caBundle` - fără el, cert-manager nu are cum să valideze certificatul
+    # HTTPS al Vault-ului (semnat de o CA proprie, necunoscută magazinului
+    # implicit de certificate) - spre deosebire de apelurile Ansible directe
+    # către Vault (`validate_certs: false`), CRD-ul Vault al cert-manager nu
+    # are un echivalent "skip verify", cere explicit un `caBundle`.
+    - name: Reaplică ClusterIssuer-ul Vault, cu HTTPS și caBundle (acum că autentificarea e completă)
+      ansible.builtin.shell:
+        cmd: |
+          cat <<EOF | kubectl apply -f -
+          apiVersion: cert-manager.io/v1
+          kind: ClusterIssuer
+          metadata:
+            name: kube-dev-ca-issuer
+          spec:
+            vault:
+              server: https://10.10.10.20:8200
+              path: pki_int/sign/kube-dev-sign
+              caBundle: {{ lookup('file', root_ca_file) | b64encode }}
+              auth:
+                kubernetes:
+                  role: cert-manager
+                  mountPath: /v1/auth/kubernetes
+                  secretRef:
+                    name: cert-manager-vault-token
+                    key: token
+          EOF
+      register: issuer_reapply
+      changed_when: "'unchanged' not in issuer_reapply.stdout"
+
+    - name: Așteaptă ca ClusterIssuer-ul să devină "Ready"
+      ansible.builtin.command:
+        cmd: kubectl get clusterissuer kube-dev-ca-issuer -o jsonpath={.status.conditions[0].status}
+      register: issuer_ready
+      until: issuer_ready.stdout == "True"
+      retries: 12
+      delay: 5
+      changed_when: false

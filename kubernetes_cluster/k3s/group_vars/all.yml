@@ -1,0 +1,26 @@
+---
+# group_vars din directorul playbook-ului au prioritate mai mare decât cele din
+# fișierele de inventar, deci aici se suprascrie sigur ansible_user pentru
+# tot ce ține de instalarea/configurarea k3s (folosim userul cu acces doar prin
+# cheie SSH, creat în ansible/playbooks/create_admin_user.yml).
+ansible_user: adm
+
+cluster_name: kube-dev
+k3s_cluster_cidr: 10.100.0.0/16
+k3s_service_cidr: 10.95.0.0/16
+
+cilium_version: "1.20.1"
+gateway_api_version: "v1.6.1"
+cert_manager_version: "v1.20.3"
+
+# Cale absolută obligatorie (nu "~/...") - folosită și ca valoare a variabilei
+# de mediu KUBECONFIG, transmisă direct subprocesului kubectl/helm, unde "~"
+# NU se expandează (spre deosebire de parametrii de tip path din modulele Ansible).
+local_kubeconfig_path: "{{ lookup('env', 'HOME') }}/.kube/{{ cluster_name }}.yaml"
+
+# Vault (pe suport-vm) e singurul loc unde există secrete ale acestui
+# proiect - vezi suport_vm/ansible/group_vars/all.yml. Playbook-urile de
+# aici nu mai citesc niciun fișier local din suport_vm/, doar tokenul root
+# din .vault_init.json (excepția locală permisă - rădăcina de încredere).
+vault_addr: "https://10.10.10.20:8200"
+vault_init_file: "{{ playbook_dir }}/../../../suport_vm/.vault_init.json"

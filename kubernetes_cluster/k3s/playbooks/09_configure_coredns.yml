@@ -1,0 +1,34 @@
+---
+# Configurează CoreDNS ca să rezolve gitlab.kube-dev.local din interiorul
+# clusterului - fără el, GitLab Runner (și mai târziu pod-urile care trag
+# imagini din registry) nu pot ajunge la GitLab prin numele de host folosit
+# și de certificatul TLS.
+- name: Configurare CoreDNS pentru rezolvarea gitlab.kube-dev.local
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+
+  vars:
+    kubeconfig: "{{ local_kubeconfig_path }}"
+
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+
+  tasks:
+    - name: Aplică ConfigMap-ul coredns-custom
+      ansible.builtin.command:
+        cmd: "kubectl apply -f {{ playbook_dir }}/../files/coredns-custom.yaml"
+      register: coredns_apply
+      changed_when: "'unchanged' not in coredns_apply.stdout"
+
+    - name: Repornește CoreDNS ca să preia configurația (doar dacă s-a schimbat)
+      ansible.builtin.command:
+        cmd: kubectl -n kube-system rollout restart deployment/coredns
+      when: coredns_apply.changed
+
+    - name: Așteaptă ca CoreDNS să fie disponibil
+      ansible.builtin.command:
+        cmd: kubectl -n kube-system rollout status deployment/coredns --timeout=60s
+      when: coredns_apply.changed
+      changed_when: false

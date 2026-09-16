@@ -1,0 +1,14 @@
+---
+adm_user: adm
+adm_ssh_public_key_path: "{{ playbook_dir }}/../../../ssh/id_ed25519.pub"
+
+# Controlează, per host, dacă playbook-ul de actualizare are voie să repornească
+# automat sistemul atunci când actualizările o cer. Implicit (allow_reboot_default)
+# niciun host nu repornește automat; pentru a permite repornirea pe un anumit host,
+# adaugă/schimbă intrarea lui în allow_reboot_per_host - fără alt fișier.
+allow_reboot_default: false
+
+allow_reboot_per_host:
+  k3s-nd01: false
+  k3s-nd02: false
+  k3s-nd03: false

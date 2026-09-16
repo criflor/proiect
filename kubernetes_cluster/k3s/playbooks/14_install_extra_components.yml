@@ -1,0 +1,240 @@
+---
+# Instalează Kafka, Redis și Keycloak în cluster (cerința 9) - fiecare într-un
+# namespace propriu, instanță unică cu persistență, resurse dimensionate
+# strict (nodurile au doar 2 GiB RAM fiecare). Instalare secvențială, cu
+# verificare după fiecare componentă - resursele sunt suficient de limitate
+# încât o problemă de scheduling trebuie prinsă devreme, nu la final.
+- name: Instalare componente suplimentare (Kafka, Redis, Keycloak)
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+
+  vars:
+    kubeconfig: "{{ local_kubeconfig_path }}"
+
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+
+  tasks:
+    - name: Instalează/actualizează Redis via Helm
+      ansible.builtin.command:
+        cmd: >
+          helm upgrade --install redis oci://registry-1.docker.io/bitnamicharts/redis
+          --namespace redis
+          --create-namespace
+          --values {{ playbook_dir }}/../files/redis-values.yaml
+      register: redis_helm
+      changed_when: "'has been upgraded' in redis_helm.stdout or 'has been installed' in redis_helm.stdout"
+
+    - name: Așteaptă ca Redis să fie disponibil
+      ansible.builtin.command:
+        cmd: kubectl -n redis rollout status statefulset/redis-master --timeout=180s
+      changed_when: false
+
+    # Chei de test - fără nicio cheie stocată, secțiunea "Keyspace" din
+    # comanda Redis "INFO" rămâne complet goală, iar receiver-ul OTel "redis"
+    # (cerința 10 - monitorizare) nu are ce raporta pentru metricile
+    # "redis.db.keys"/"redis.db.expires"/"redis.db.avg_ttl" - verificat
+    # practic, vezi documentația.
+    - name: Citește parola Redis
+      ansible.builtin.command:
+        cmd: >
+          kubectl -n redis get secret redis -o jsonpath={.data.redis-password}
+      register: redis_password_b64
+      changed_when: false
+
+    - name: Creează chei de test în Redis (idempotent)
+      ansible.builtin.command:
+        cmd: >
+          kubectl -n redis exec redis-master-0 --
+          redis-cli -a {{ redis_password_b64.stdout | b64decode }}
+          {{ item }}
+      loop:
+        - "SET monitorizare:test:key1 ping"
+        - "SET monitorizare:test:key2 ping EX 3600"
+      loop_control:
+        label: "{{ item.split(' ')[1] }}"
+      changed_when: true
+      no_log: true
+
+    - name: Instalează/actualizează Kafka via Helm
+      ansible.builtin.command:
+        cmd: >
+          helm upgrade --install kafka oci://registry-1.docker.io/bitnamicharts/kafka
+          --namespace kafka
+          --create-namespace
+          --values {{ playbook_dir }}/../files/kafka-values.yaml
+      register: kafka_helm
+      changed_when: "'has been upgraded' in kafka_helm.stdout or 'has been installed' in kafka_helm.stdout"
+
+    - name: Așteaptă ca Kafka să fie disponibil
+      ansible.builtin.command:
+        cmd: kubectl -n kafka rollout status statefulset/kafka-controller --timeout=240s
+      changed_when: false
+
+    # Topic de test + trafic minim continuu - fără el, Kafka rămâne un
+    # cluster gol (niciun topic, niciun consumator), iar metricile de
+    # topologie/lag ale receiver-ului "kafkametrics" din colectorul OTel
+    # (cerința 10 - monitorizare) rămân goale, deși infrastructura de
+    # colectare e funcțională (verificat practic - vezi documentația).
+    - name: Creează topicul de test Kafka (idempotent)
+      ansible.builtin.command:
+        cmd: >
+          kubectl -n kafka exec kafka-controller-0 -c kafka --
+          env JMX_PORT=
+          kafka-topics.sh --bootstrap-server localhost:9092
+          --create --if-not-exists
+          --topic monitorizare-test --partitions 3 --replication-factor 1
+      register: kafka_topic_create
+      changed_when: "'Created topic' in kafka_topic_create.stdout"
+
+    - name: Instalează un producător/consumator continuu de test (trafic minim pentru dashboard)
+      ansible.builtin.shell:
+        cmd: |
+          cat <<'EOF' | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: CronJob
+          metadata:
+            name: kafka-test-producer
+            namespace: kafka
+          spec:
+            schedule: "* * * * *"
+            concurrencyPolicy: Forbid
+            jobTemplate:
+              spec:
+                template:
+                  spec:
+                    restartPolicy: Never
+                    containers:
+                      - name: producer
+                        image: bitnamilegacy/kafka:4.0.0-debian-12-r10
+                        env:
+                          - name: JMX_PORT
+                            value: ""
+                          - name: KAFKA_HEAP_OPTS
+                            value: "-Xmx128m -Xms64m"
+                        command:
+                          - bash
+                          - -c
+                          - "echo \"ping $(date -u +%FT%TZ)\" | kafka-console-producer.sh --bootstrap-server kafka.kafka.svc.cluster.local:9092 --topic monitorizare-test"
+                        resources:
+                          requests: {cpu: 20m, memory: 128Mi}
+                          limits: {cpu: 100m, memory: 256Mi}
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: kafka-test-consumer
+            namespace: kafka
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: kafka-test-consumer
+            template:
+              metadata:
+                labels:
+                  app: kafka-test-consumer
+              spec:
+                containers:
+                  - name: consumer
+                    image: bitnamilegacy/kafka:4.0.0-debian-12-r10
+                    env:
+                      - name: JMX_PORT
+                        value: ""
+                      - name: KAFKA_HEAP_OPTS
+                        value: "-Xmx128m -Xms64m"
+                    command:
+                      - kafka-console-consumer.sh
+                      - --bootstrap-server
+                      - kafka.kafka.svc.cluster.local:9092
+                      - --topic
+                      - monitorizare-test
+                      - --group
+                      - monitorizare-test-consumer
+                    resources:
+                      requests: {cpu: 20m, memory: 128Mi}
+                      limits: {cpu: 100m, memory: 256Mi}
+          EOF
+      register: kafka_test_traffic_apply
+      changed_when: "'unchanged' not in kafka_test_traffic_apply.stdout"
+
+    - name: Instalează/actualizează Keycloak via Helm
+      ansible.builtin.command:
+        cmd: >
+          helm upgrade --install keycloak oci://registry-1.docker.io/bitnamicharts/keycloak
+          --namespace keycloak
+          --create-namespace
+          --values {{ playbook_dir }}/../files/keycloak-values.yaml
+      register: keycloak_helm
+      changed_when: "'has been upgraded' in keycloak_helm.stdout or 'has been installed' in keycloak_helm.stdout"
+
+    - name: Așteaptă ca baza de date internă Keycloak să fie disponibilă
+      ansible.builtin.command:
+        cmd: kubectl -n keycloak rollout status statefulset/keycloak-postgresql --timeout=180s
+      changed_when: false
+
+    - name: Așteaptă ca Keycloak să fie disponibil
+      ansible.builtin.command:
+        cmd: kubectl -n keycloak rollout status statefulset/keycloak --timeout=240s
+      changed_when: false
+
+    - name: Expune Keycloak prin Gateway
+      ansible.builtin.shell:
+        cmd: |
+          cat <<'EOF' | kubectl apply -f -
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: HTTPRoute
+          metadata:
+            name: keycloak
+            namespace: keycloak
+          spec:
+            parentRefs:
+              - name: kube-dev-gateway
+                namespace: gateway
+                sectionName: https
+            hostnames:
+              - "keycloak.kube-dev.local"
+            rules:
+              - backendRefs:
+                  - name: keycloak
+                    port: 80
+          EOF
+      register: keycloak_route_apply
+      changed_when: "'unchanged' not in keycloak_route_apply.stdout"
+
+    - name: Adaugă keycloak.kube-dev.local în /etc/hosts (mașina de control)
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        line: "10.10.10.192 keycloak.kube-dev.local"
+        regexp: "keycloak\\.kube-dev\\.local$"
+      become: true
+
+    - name: Citește parola de admin Keycloak (dacă e generată de chart)
+      ansible.builtin.command:
+        cmd: kubectl -n keycloak get secret keycloak -o jsonpath={.data.admin-password}
+      register: keycloak_pw_b64
+      failed_when: false
+      changed_when: false
+
+    - name: Citește tokenul root Vault
+      ansible.builtin.slurp:
+        src: "{{ vault_init_file }}"
+      register: vault_root_read
+      when: keycloak_pw_b64.rc == 0 and keycloak_pw_b64.stdout | length > 0
+
+    - name: Scrie parola de admin Keycloak în Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/secret/data/keycloak/admin_password"
+        validate_certs: false
+        method: POST
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        body_format: json
+        body:
+          data:
+            value: "{{ keycloak_pw_b64.stdout | b64decode }}"
+        status_code: 200
+      when: keycloak_pw_b64.rc == 0 and keycloak_pw_b64.stdout | length > 0
+      no_log: true

@@ -1,0 +1,29 @@
+# Aplicația Argo CD de DEV - urmărește branch-ul separat "dev" (neprotejat)
+# al aceluiași proiect demo-app-manifests, actualizat direct (fără Merge
+# Request) de apps/demo_app/.gitlab-ci.yml la orice push pe un branch diferit
+# de "main" - buclă rapidă de dezvoltare, în paralel cu fluxul de producție
+# (demo-app, vezi argocd-application.yaml), care rămâne strict prin MR.
+# Un singur mediu de dev comun (nu unul per branch de sursă).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: demo-app-dev
+  namespace: argocd
+spec:
+  project: default
+
+  source:
+    repoURL: https://gitlab.kube-dev.local/appadm/demo-app-manifests.git
+    targetRevision: dev
+    path: overlays/dev
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: demo-app-dev
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

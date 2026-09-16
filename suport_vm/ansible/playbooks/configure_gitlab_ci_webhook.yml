@@ -1,0 +1,139 @@
+---
+# Configurează, prin API-ul GitLab, un webhook de proiect care trimite
+# evenimente de pipeline/job către colectorul OTel din cluster (cerința 10 -
+# observabilitate CI/CD, receiver "gitlab" - vezi
+# kubernetes_cluster/k3s/playbooks/15_install_monitoring.yml). Secretul
+# webhook e generat AICI (nu în cluster) - suport_vm trebuie să poată fi
+# construit independent, fără să depindă de kubernetes_cluster. Clusterul
+# doar CITEȘTE acest secret (verifică că există, nu îl generează) - dacă
+# rulează 15_install_monitoring.yml înaintea acestui playbook, va eșua
+# explicit, cerând ca acesta să ruleze întâi.
+- name: Adaugă rezolvare DNS pentru endpoint-ul webhook din cluster
+  hosts: suport
+  become: true
+
+  tasks:
+    - name: Adaugă ci-events.kube-dev.local în /etc/hosts (necesar ca GitLab să trimită webhook-uri în cluster)
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        line: "10.10.10.192 ci-events.kube-dev.local"
+        regexp: "ci-events\\.kube-dev\\.local$"
+
+- name: Configurare webhook GitLab pentru trace-uri CI/CD (via API)
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+
+  vars:
+    gitlab_hostname: gitlab.kube-dev.local
+    vault_automation_token_path: secret/data/gitlab/automation_token
+    vault_webhook_secret_path: secret/data/gitlab/webhook_secret
+    demo_app_project_path: appadm/demo-app
+    webhook_url: "https://ci-events.kube-dev.local/events"
+
+  tasks:
+    - name: Citește tokenul root Vault
+      ansible.builtin.slurp:
+        src: "{{ vault_init_file }}"
+      register: vault_root_read
+
+    - name: Citește token-ul de automatizare din Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/{{ vault_automation_token_path }}"
+        validate_certs: false
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+      register: automation_token_read
+      no_log: true
+
+    # Token folosit de GitLab pentru a semna evenimentele webhook (header
+    # "X-Gitlab-Token") - receiver-ul "gitlab" din colector îl verifică la
+    # fiecare cerere, ca endpoint-ul expus public (prin Gateway) să nu
+    # accepte orice request. Generat aici (o singură dată) și scris în
+    # Vault - clusterul (15_install_monitoring.yml) doar îl citește de
+    # acolo, nu îl mai generează.
+    - name: Verifică dacă secretul webhook GitLab există deja în Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/{{ vault_webhook_secret_path }}"
+        validate_certs: false
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        status_code: [200, 404]
+      register: webhook_secret_check
+
+    - name: Generează secretul webhook GitLab (o singură dată)
+      ansible.builtin.set_fact:
+        webhook_secret_gen: "{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
+      when: webhook_secret_check.status == 404
+
+    - name: Scrie secretul webhook GitLab în Vault (o singură dată)
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/{{ vault_webhook_secret_path }}"
+        validate_certs: false
+        method: POST
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        body_format: json
+        body:
+          data:
+            value: "{{ webhook_secret_gen }}"
+        status_code: 200
+      when: webhook_secret_check.status == 404
+      no_log: true
+
+    - name: Citește secretul webhook GitLab din Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/{{ vault_webhook_secret_path }}"
+        validate_certs: false
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+      register: webhook_secret_read
+      no_log: true
+
+    # GitLab respinge implicit ("Invalid url given") orice webhook către o
+    # adresă considerată rețea locală/privată (protecție SSRF) - endpoint-ul
+    # colectorului OTel e exact asta (10.10.10.0/24, rețeaua internă a
+    # proiectului). Verificat practic, vezi documentația.
+    - name: Permite webhook-uri către rețeaua locală (necesar pentru endpoint-ul intern al colectorului OTel)
+      ansible.builtin.uri:
+        url: "https://{{ gitlab_hostname }}/api/v4/application/settings"
+        method: PUT
+        headers:
+          PRIVATE-TOKEN: "{{ automation_token_read.json.data.data.value }}"
+        body_format: form-urlencoded
+        body:
+          allow_local_requests_from_web_hooks_and_services: true
+        validate_certs: false
+        status_code: 200
+
+    - name: Listează webhook-urile existente pe proiectul demo-app
+      ansible.builtin.uri:
+        url: "https://{{ gitlab_hostname }}/api/v4/projects/{{ demo_app_project_path | replace('/', '%2F') }}/hooks"
+        headers:
+          PRIVATE-TOKEN: "{{ automation_token_read.json.data.data.value }}"
+        validate_certs: false
+        return_content: true
+      register: webhooks_check
+
+    # Certificatul CA propriu al GitLab nu e de încredere implicit pentru
+    # GitLab însuși atunci când verifică SSL-ul destinației webhook-ului -
+    # dezactivat explicit (rețea internă, de încredere, nu internet public).
+    - name: Creează webhook-ul de pipeline/job pentru colectorul OTel (o singură dată)
+      ansible.builtin.uri:
+        url: "https://{{ gitlab_hostname }}/api/v4/projects/{{ demo_app_project_path | replace('/', '%2F') }}/hooks"
+        method: POST
+        headers:
+          PRIVATE-TOKEN: "{{ automation_token_read.json.data.data.value }}"
+        body_format: form-urlencoded
+        body:
+          url: "{{ webhook_url }}"
+          token: "{{ webhook_secret_read.json.data.data.value }}"
+          push_events: false
+          pipeline_events: true
+          job_events: true
+          enable_ssl_verification: false
+        validate_certs: false
+        status_code: 201
+      when: webhooks_check.json | selectattr('url', 'equalto', webhook_url) | list | length == 0
+      no_log: true

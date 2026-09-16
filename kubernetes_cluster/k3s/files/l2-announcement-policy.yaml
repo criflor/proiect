@@ -1,0 +1,27 @@
+# Pool de adrese IP pentru serviciile de tip LoadBalancer, alocate din
+# rețeaua dedicată clusterului (10.10.10.0/24, definită în Terraform ca
+# libvirt_network.k8s, fără DHCP) - un interval liber, în afara IP-urilor
+# statice ale nodurilor (10.10.10.10-12).
+apiVersion: cilium.io/v2alpha1
+kind: CiliumLoadBalancerIPPool
+metadata:
+  name: kube-dev-pool
+spec:
+  blocks:
+    - cidr: 10.10.10.192/28
+---
+# Anunță prin ARP (L2), pe toate nodurile, IP-urile alocate din pool-ul de mai
+# sus - fără asta, Cilium alocă IP-ul serviciului, dar nimeni nu răspunde la
+# ARP pentru el. Fără "nodeSelector" - topologie HA simetrică (toate nodurile
+# sunt și control-plane și worker, toate au eticheta
+# "node-role.kubernetes.io/control-plane"; un filtru "DoesNotExist" pe acea
+# etichetă, folosit când exista o separare clară control-plane/worker,
+# n-ar mai selecta niciun nod acum).
+apiVersion: cilium.io/v2alpha1
+kind: CiliumL2AnnouncementPolicy
+metadata:
+  name: kube-dev-l2-announce
+spec:
+  loadBalancerIPs: true
+  interfaces:
+    - ^en.+

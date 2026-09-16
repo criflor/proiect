@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: otel-collector
+  template:
+    metadata:
+      labels:
+        app: otel-collector
+    spec:
+      serviceAccountName: otel-collector
+      containers:
+        - name: otel-collector
+          image: otel/opentelemetry-collector-contrib:0.160.0
+          args: ["--config=/etc/otel/config.yaml"]
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-password-mirror
+                  key: redis-password
+            - name: GITLAB_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: gitlab-webhook-secret
+                  key: secret
+          ports:
+            - containerPort: 4317
+            - containerPort: 4318
+            - containerPort: 8081
+          volumeMounts:
+            - name: config
+              mountPath: /etc/otel
+            - name: ca-cert
+              mountPath: /etc/otel-ca
+          resources:
+            requests:
+              cpu: 50m
+              memory: 96Mi
+            limits:
+              cpu: 250m
+              memory: 200Mi
+      volumes:
+        - name: config
+          configMap:
+            name: otel-collector-config
+        - name: ca-cert
+          configMap:
+            name: otel-collector-ca
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+  namespace: monitoring
+spec:
+  selector:
+    app: otel-collector
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317
+    - name: otlp-http
+      port: 4318
+      targetPort: 4318
+    - name: gitlab-webhook
+      port: 8081
+      targetPort: 8081

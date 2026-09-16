@@ -1,0 +1,169 @@
+---
+# Activează autentificarea OIDC (Keycloak) în Argo CD - metodă ALTERNATIVĂ,
+# adăugată alături de contul local "admin" existent, fără să-l dezactiveze.
+# Grupul Keycloak "sso-admins" (creat de 19_configure_sso_keycloak.yml,
+# conține "ssoadm") primește rolul intern "role:admin" - drepturi echivalente
+# adminului local, nu o policy RBAC nouă/restrânsă.
+- name: Configurare autentificare OIDC (Keycloak) în Argo CD
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+
+  vars:
+    kubeconfig: "{{ local_kubeconfig_path }}"
+    keycloak_hostname: keycloak.kube-dev.local
+    sso_realm: kube-dev
+    sso_group: sso-admins
+    argocd_oidc_client_path: secret/data/keycloak/argocd_oidc_client
+    argocd_secret_key: oidc.keycloak.clientSecret
+    root_ca_file: "{{ playbook_dir }}/../files/gitlab-kube-dev-local-ca.crt"
+
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+
+  tasks:
+    - name: Citește tokenul root Vault
+      ansible.builtin.slurp:
+        src: "{{ vault_init_file }}"
+      register: vault_root_read
+
+    - name: Citește credențialele clientului OIDC "argocd" din Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/{{ argocd_oidc_client_path }}"
+        validate_certs: false
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+      register: argocd_oidc_client_read
+      no_log: true
+
+    # Convenția Argo CD: secretul clientului OIDC nu se scrie direct în
+    # "argocd-cm" (ConfigMap, necriptat) - se scrie o cheie nouă în Secret-ul
+    # "argocd-secret", referențiată din ConfigMap ca "$argocd-secret:<cheie>".
+    # NU se face "kubectl apply" cu tot obiectul Secret (l-ar înlocui complet,
+    # ștergând cheile existente ale Argo CD - cheia de semnare a sesiunilor,
+    # hash-ul parolei locale de admin etc.) - doar "patch --type merge",
+    # și doar dacă valoarea chiar diferă (evită un restart inutil la fiecare
+    # rulare).
+    # "argocd_secret_key" conține puncte ("oidc.keycloak.clientSecret") -
+    # jsonpath le-ar interpreta ca segmente imbricate, nu ca o singură cheie
+    # plată, indiferent cum au fost scăpate (verificat practic, prin mai
+    # multe încercări - inclusiv notația cu paranteze drepte - niciuna nu s-a
+    # comportat consecvent prin cele trei niveluri de scăpare YAML→Jinja→shell
+    # implicate). Citim tot obiectul ca JSON și extragem cheia direct în
+    # Jinja (acces la dicționar, insensibil la punctele din nume).
+    - name: Citește "argocd-secret" ca JSON
+      ansible.builtin.command:
+        cmd: kubectl -n argocd get secret argocd-secret -o json
+      register: argocd_secret_json
+      changed_when: false
+      no_log: true
+
+    - name: Scrie secretul clientului OIDC în "argocd-secret" (doar dacă s-a schimbat)
+      ansible.builtin.shell:
+        cmd: >
+          kubectl -n argocd patch secret argocd-secret --type merge
+          -p {{ ('{"stringData":{"' + argocd_secret_key + '":"' + argocd_oidc_client_read.json.data.data.client_secret + '"}}') | quote }}
+      register: argocd_secret_patch
+      when: >
+        ((argocd_secret_json.stdout | from_json).data[argocd_secret_key] | default('') | b64decode)
+        != argocd_oidc_client_read.json.data.data.client_secret
+      changed_when: true
+      no_log: true
+
+    # "rootCA" - clientul HTTP intern al Argo CD (ca și cel al Vault-ului,
+    # §16.2) verifică strict cu magazinul de încredere de sistem, unde
+    # rădăcina noastră PKI nu e instalată - fără acest câmp, discovery-ul
+    # OIDC eșuează cu "certificate signed by unknown authority" (verificat
+    # practic). Construit ca structură de date (dict), nu ca text imbricat
+    # manual - "oidc.config" e el însuși YAML înserat ca STRING într-un
+    # ConfigMap, deci ar însemna un block scalar "rootCA: |" imbricat într-un
+    # alt block scalar "oidc.config: |" - indentare corectă imposibil de
+    # calculat manual, cu filtrul "indent()" aplicat la niveluri diferite
+    # (verificat practic - a produs YAML invalid, indentare inconsecventă
+    # între prima linie și restul).  Serializarea cu "to_nice_yaml" elimină
+    # complet problema - Ansible/PyYAML calculează singur indentarea corectă
+    # a fiecărui nivel.
+    - name: Construiește conținutul "oidc.config" (ca structură de date)
+      ansible.builtin.set_fact:
+        argocd_oidc_config_dict:
+          name: Keycloak
+          issuer: "https://{{ keycloak_hostname }}/realms/{{ sso_realm }}"
+          clientID: "{{ argocd_oidc_client_read.json.data.data.client_id }}"
+          clientSecret: "$argocd-secret:{{ argocd_secret_key }}"
+          requestedScopes: ["openid", "profile", "email", "groups"]
+          rootCA: "{{ lookup('file', root_ca_file) }}"
+      no_log: true
+
+    # "url" trebuie setat explicit - Argo CD construiește redirect_uri-ul
+    # OIDC (".../auth/callback") pe baza acestei valori; fără el, rămâne pe
+    # implicitul "localhost", nefolosibil din browser extern.
+    - name: Configurează "url" și "oidc.config" în "argocd-cm"
+      ansible.builtin.copy:
+        dest: "{{ playbook_dir }}/../../.argocd-cm.yaml"
+        content: >-
+          {{
+            {
+              'apiVersion': 'v1',
+              'kind': 'ConfigMap',
+              'metadata': {
+                'name': 'argocd-cm',
+                'namespace': 'argocd',
+                'labels': {'app.kubernetes.io/part-of': 'argocd'}
+              },
+              'data': {
+                'url': 'https://argocd.kube-dev.local',
+                'oidc.config': argocd_oidc_config_dict | to_nice_yaml
+              }
+            } | to_nice_yaml
+          }}
+        mode: "0600"
+      no_log: true
+
+    - name: Aplică "argocd-cm"
+      ansible.builtin.command:
+        cmd: "kubectl apply -f {{ playbook_dir }}/../../.argocd-cm.yaml"
+      register: argocd_cm_apply
+      changed_when: "'unchanged' not in argocd_cm_apply.stdout"
+
+    # Fișierul temporar conține clientSecret în clar - șters imediat după
+    # aplicare, consecvent cu regula proiectului "niciun secret pe disc, în
+    # afara .vault_init.json" (§12.1).
+    - name: Șterge fișierul temporar "argocd-cm"
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/../../.argocd-cm.yaml"
+        state: absent
+
+    # Rolul intern "role:admin" al Argo CD - drepturi depline (echivalent
+    # userului local "admin"), legat de grupul Keycloak, nu de un user
+    # individual - oricine e adăugat ulterior în "sso-admins" moștenește
+    # automat aceleași drepturi.
+    - name: Configurează RBAC-ul ("argocd-rbac-cm") - grupul "{{ sso_group }}" -> role:admin
+      ansible.builtin.shell:
+        cmd: |
+          cat <<'EOF' | kubectl apply -f -
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: argocd-rbac-cm
+            namespace: argocd
+            labels:
+              app.kubernetes.io/part-of: argocd
+          data:
+            policy.csv: |
+              g, sso-admins, role:admin
+            policy.default: role:readonly
+          EOF
+      register: argocd_rbac_apply
+      changed_when: "'unchanged' not in argocd_rbac_apply.stdout"
+
+    - name: Repornește argocd-server dacă s-a schimbat configurația OIDC/RBAC
+      ansible.builtin.command:
+        cmd: kubectl -n argocd rollout restart deployment/argocd-server
+      when: argocd_cm_apply.changed or argocd_rbac_apply.changed or (argocd_secret_patch.changed | default(false))
+      changed_when: true
+
+    - name: Așteaptă ca argocd-server să fie disponibil
+      ansible.builtin.command:
+        cmd: kubectl -n argocd rollout status deployment/argocd-server --timeout=120s
+      changed_when: false

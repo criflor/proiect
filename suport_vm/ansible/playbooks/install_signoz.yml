@@ -1,0 +1,413 @@
+---
+# Instalează SigNoz (cerința 10 - monitorizare) pe VM-ul de suport, prin
+# Foundry (foundryctl) - metoda oficială curentă. Vechiul `install.sh` +
+# docker-compose distribuit direct în repo-ul SigNoz a fost deprecat între
+# timp (v0.97.0 -> v0.141.1); acea variantă a mai avut și un bug intern
+# reproductibil ("panic: duplicate metrics collector registration
+# attempted"), care ducea la o buclă de restart-uri - verificat practic,
+# nelegat de nicio configurație proprie (dashboard, alertă, canal). Colectorul
+# OTLP al SigNoz-ului e expus către cluster pentru ingestia de metrici/trace-
+# uri (§ separat, kubernetes_cluster/k3s/playbooks) - din cluster, nu din SigNoz însuși.
+- name: Instalare SigNoz (Foundry)
+  hosts: suport
+  become: true
+
+  vars:
+    foundry_dir: /opt/signoz-foundry
+    foundryctl_bin: /root/.local/bin/foundryctl
+    # Rulează pe chiar hostul Vault-ului - vezi comentariul identic din
+    # install_gitlab.yml.
+    vault_addr: "http://127.0.0.1:8201"
+    signoz_hostname: signoz.kube-dev.local
+    signoz_certs_dir: /etc/signoz/certs
+    # Portul 443 e deja ocupat de nginx-ul GitLab (bundle-uit, Omnibus) -
+    # SigNoz primește propriul nginx, dedicat, pe un port separat.
+    signoz_https_port: 8443
+
+  tasks:
+    - name: Verifică dacă foundryctl e deja instalat
+      ansible.builtin.command:
+        cmd: "{{ foundryctl_bin }} version"
+      register: foundryctl_check
+      failed_when: false
+      changed_when: false
+
+    - name: Instalează foundryctl (script oficial)
+      ansible.builtin.shell:
+        cmd: curl -fsSL https://signoz.io/foundry.sh | bash
+      environment:
+        HOME: /root
+      when: foundryctl_check.rc != 0
+
+    - name: Creează directorul de lucru Foundry
+      ansible.builtin.file:
+        path: "{{ foundry_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Citește tokenul root Vault
+      ansible.builtin.slurp:
+        src: "{{ vault_init_file }}"
+      register: vault_root_read
+      delegate_to: localhost
+      become: false
+
+    - name: Creează directorul pentru certificatul SigNoz
+      ansible.builtin.file:
+        path: "{{ signoz_certs_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Verifică dacă certificatul SigNoz a fost deja emis
+      ansible.builtin.stat:
+        path: "{{ signoz_certs_dir }}/signoz.crt"
+      register: signoz_cert_check
+
+    # Certificat emis din intermediara Vault (rolul "kube-dev", ca la GitLab),
+    # cu IP SAN explicit pentru 10.10.10.20 - colectorul din cluster se
+    # conectează la ingester pe IP, nu pe hostname (§13, tiparul folosit deja
+    # pentru certificatul propriu al Vault-ului).
+    - name: Emite certificatul SigNoz din Vault PKI (o singură dată)
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/pki_int/issue/kube-dev"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        body_format: json
+        body:
+          common_name: "{{ signoz_hostname }}"
+          ip_sans: "10.10.10.20"
+        status_code: 200
+      register: signoz_cert_issue
+      when: not signoz_cert_check.stat.exists
+
+    - name: Scrie certificatul SigNoz (leaf + intermediară)
+      ansible.builtin.copy:
+        content: "{{ signoz_cert_issue.json.data.certificate }}\n{{ signoz_cert_issue.json.data.issuing_ca }}"
+        dest: "{{ signoz_certs_dir }}/signoz.crt"
+        mode: "0644"
+      when: signoz_cert_issue is not skipped
+
+    # Mode 0644 (nu 0600, ca la GitLab) - consumatorul e containerul
+    # "ingester" al SigNoz, rulat cu un user non-root fără drept de citire pe
+    # un fișier 0600 deținut de root al hostului (verificat practic:
+    # "permission denied" la reîncărcarea configurației). Directorul rămâne
+    # accesibil doar de root ({{ signoz_certs_dir }}, mode 0755).
+    - name: Scrie cheia privată a certificatului SigNoz
+      ansible.builtin.copy:
+        content: "{{ signoz_cert_issue.json.data.private_key }}"
+        dest: "{{ signoz_certs_dir }}/signoz.key"
+        mode: "0644"
+      when: signoz_cert_issue is not skipped
+      no_log: true
+
+    # Portul 8080 al containerului "signoz" e remapat pe 3301 (8080 e deja
+    # ocupat de Puma-ul GitLab) - via patch declarativ, nu editare manuală a
+    # fișierelor generate în pours/ (Foundry le suprascrie la fiecare "forge",
+    # exact cum avertizează documentația oficială).
+    #
+    # Al doilea patch (target diferit de "deployment/compose.yaml") activează
+    # TLS pe receiver-ul gRPC al ingester-ului (portul 4317, ingestia de
+    # telemetrie din cluster) - verificat practic că Foundry acceptă patch-uri
+    # pe orice fișier generat, nu doar pe compose.yaml. Al treilea montează
+    # certificatul (deja pe disc, scris mai sus) în container.
+    - name: Scrie casting.yaml (configurația declarativă Foundry)
+      ansible.builtin.copy:
+        content: |
+          apiVersion: v1alpha1
+          kind: Installation
+          metadata:
+            name: signoz
+          spec:
+            deployment:
+              flavor: compose
+              mode: docker
+            patches:
+              - target: "deployment/compose.yaml"
+                operations:
+                  - op: replace
+                    path: /services/signoz-signoz-0/ports/0
+                    value: "3301:8080"
+                  - op: add
+                    path: /services/ingester/volumes/-
+                    value: "{{ signoz_certs_dir }}:/etc/otel-certs:ro"
+              - target: "deployment/ingester/ingester.yaml"
+                operations:
+                  - op: add
+                    path: /receivers/otlp/protocols/grpc/tls
+                    value:
+                      cert_file: /etc/otel-certs/signoz.crt
+                      key_file: /etc/otel-certs/signoz.key
+        dest: "{{ foundry_dir }}/casting.yaml"
+        mode: "0644"
+      register: casting_file
+
+    - name: Aplică stack-ul SigNoz (foundryctl cast)
+      ansible.builtin.command:
+        cmd: "{{ foundryctl_bin }} cast -f casting.yaml"
+        chdir: "{{ foundry_dir }}"
+      environment:
+        HOME: /root
+      register: signoz_cast
+      changed_when: casting_file.changed
+
+    # "docker compose up" (rulat intern de foundryctl cast) recreează automat
+    # ingester-ul când "compose.yaml" se schimbă (volumul nou montat mai sus) -
+    # dar dacă doar certificatul e reemis ulterior (fișierul de pe disc se
+    # schimbă, "compose.yaml" rămâne identic), containerul NU repornește
+    # singur (bind mount, nu e diff-uit de docker compose) - verificat
+    # practic. Restart explicit, necondiționat de recreere, ca să acopere și
+    # acest caz.
+    - name: Repornește ingester-ul SigNoz ca să preia certificatul TLS
+      ansible.builtin.command:
+        cmd: docker restart signoz-ingester-1
+      when: casting_file.changed or signoz_cert_issue is not skipped
+      changed_when: true
+
+    - name: Așteaptă ca query-service-ul SigNoz să răspundă
+      ansible.builtin.uri:
+        url: http://localhost:3301/api/v1/health
+        status_code: 200
+      register: signoz_health
+      until: signoz_health.status == 200
+      retries: 30
+      delay: 10
+
+    # La prima pornire, SigNoz nu are niciun cont/organizație - fără asta,
+    # OpAmp (mecanismul prin care query-service-ul configurează de la
+    # distanță colectorul OTel intern) refuză să livreze vreo configurație,
+    # iar receiver-ul OTLP nu ajunge niciodată să asculte pe porturi
+    # (verificat practic - vezi documentația, secțiunea "Probleme întâlnite").
+    # Bootstrap-ul e echivalentul API al primului ecran din UI ("Get Started").
+    - name: Verifică dacă SigNoz are deja o organizație configurată
+      ansible.builtin.uri:
+        url: http://localhost:3301/api/v1/version
+        return_content: true
+      register: signoz_version_check
+
+    - name: Generează parola de admin SigNoz (o singură dată, păstrată doar în Vault)
+      ansible.builtin.set_fact:
+        signoz_admin_password: "{{ lookup('password', '/dev/null length=20 chars=ascii_letters,digits') }}A1!"
+      when: not (signoz_version_check.json.setupCompleted | default(false))
+
+    - name: Creează organizația și contul de admin SigNoz
+      ansible.builtin.uri:
+        url: http://localhost:3301/api/v1/register
+        method: POST
+        body_format: json
+        body:
+          email: admin@kube-dev.local
+          password: "{{ signoz_admin_password }}"
+          name: admin
+          orgId: ""
+          orgName: kube-dev
+          isAnonymous: false
+        status_code: [200, 201]
+      when: not (signoz_version_check.json.setupCompleted | default(false))
+
+    - name: Scrie parola de admin SigNoz în Vault (o singură dată)
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/secret/data/signoz/admin_password"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        body_format: json
+        body:
+          data:
+            value: "{{ signoz_admin_password }}"
+        status_code: 200
+      when: not (signoz_version_check.json.setupCompleted | default(false))
+      no_log: true
+
+    # Restul task-urilor au nevoie de un token de autentificare, indiferent
+    # dacă parola tocmai a fost generată mai sus sau exista deja dintr-o
+    # rulare anterioară - de aceea o citim mereu din Vault, nu din fact-ul
+    # de mai sus (setat doar condiționat).
+    - name: Citește parola de admin SigNoz din Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/secret/data/signoz/admin_password"
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+      register: signoz_password_read
+      no_log: true
+
+    # De la v0.141.1, autentificarea nu mai e "/api/v1/login" (rută eliminată
+    # complet, fără nicio urmă în sursă - verificat direct din codul Go al
+    # acestei versiuni, clonat pe VM) - e "/api/v2/sessions/email_password" și
+    # cere explicit "orgId" în body, nu doar email/parolă (verificat practic -
+    # vezi documentația, secțiunea "Probleme întâlnite").
+    - name: Obține ID-ul organizației (direct din Postgres - niciun endpoint public nu-l expune)
+      ansible.builtin.command:
+        cmd: >
+          docker exec signoz-metastore-postgres-0
+          psql -U signoz -d signoz -t -A -c "SELECT id FROM organizations LIMIT 1"
+      register: signoz_org_id
+      changed_when: false
+
+    - name: Autentificare la API-ul SigNoz
+      ansible.builtin.uri:
+        url: http://localhost:3301/api/v2/sessions/email_password
+        method: POST
+        body_format: json
+        body:
+          email: admin@kube-dev.local
+          password: "{{ signoz_password_read.json.data.data.value }}"
+          orgId: "{{ signoz_org_id.stdout | trim }}"
+        status_code: 200
+      register: signoz_login
+      no_log: true
+
+    - name: Verifică dacă există deja canalul de notificare pentru alerte
+      ansible.builtin.uri:
+        url: http://localhost:3301/api/v1/channels
+        headers:
+          Authorization: "Bearer {{ signoz_login.json.data.accessToken }}"
+        return_content: true
+      register: signoz_channels_check
+
+    # Canal de tip webhook - suficient pentru a demonstra ciclul complet
+    # colectare -> alertă -> notificare, fără dependență de un server de
+    # e-mail/Slack extern (niciunul disponibil în acest mediu). De la
+    # v0.141.1, formatul e cel nativ Alertmanager (`webhook_configs`), nu
+    # wrapper-ul simplificat "type"/"webhook" din versiunile vechi - verificat
+    # practic, vezi documentația.
+    - name: Creează canalul de notificare pentru alerte
+      ansible.builtin.uri:
+        url: http://localhost:3301/api/v1/channels
+        method: POST
+        headers:
+          Authorization: "Bearer {{ signoz_login.json.data.accessToken }}"
+        body_format: json
+        body:
+          name: monitorizare-infra-01
+          webhook_configs:
+            - url: "http://localhost:9999/alerts"
+        status_code: 201
+      when: signoz_channels_check.json.data | selectattr('name', 'equalto', 'monitorizare-infra-01') | list | length == 0
+
+    - name: Verifică dacă există deja regula de alertă pentru componente indisponibile
+      ansible.builtin.uri:
+        url: http://localhost:3301/api/v1/rules
+        headers:
+          Authorization: "Bearer {{ signoz_login.json.data.accessToken }}"
+        return_content: true
+      register: signoz_rules_check
+
+    # Alertă de prag pe metrica "up" (generată automat de receiver-ul
+    # Prometheus al colectorului pentru fiecare țintă scrapuită - Kafka,
+    # Keycloak, PostgreSQL) - se declanșează dacă oricare dintre componente nu
+    # mai răspunde la scraping timp de 5 minute consecutive (cerința 10: cel
+    # puțin o alertă funcțională). Interogarea NU grupează după
+    # "service.name" - un `groupBy` pe acea etichetă a dus la o eroare internă
+    # ClickHouse la parsarea JSON a coloanei "labels" (verificat practic - vezi
+    # documentația, secțiunea "Probleme întâlnite"); media simplă peste toate
+    # țintele scade sub 1 de îndată ce oricare dintre ele raportează 0, ceea ce
+    # e suficient pentru a detecta "cel puțin o componentă indisponibilă".
+    # Schema regulii ("v5") s-a schimbat complet față de versiunile vechi -
+    # verificat practic din codul sursă al acestei versiuni, vezi documentația.
+    - name: Creează regula de alertă "componentă indisponibilă"
+      ansible.builtin.uri:
+        url: http://localhost:3301/api/v1/rules
+        method: POST
+        headers:
+          Authorization: "Bearer {{ signoz_login.json.data.accessToken }}"
+        body_format: json
+        body:
+          alert: "Componenta indisponibila (Kafka/Keycloak/PostgreSQL)"
+          alertType: METRIC_BASED_ALERT
+          ruleType: threshold_rule
+          version: v5
+          evalWindow: 5m0s
+          frequency: 1m0s
+          condition:
+            compositeQuery:
+              queryType: builder
+              queries:
+                - type: builder_query
+                  spec:
+                    name: A
+                    signal: metrics
+                    aggregations:
+                      - metricName: up
+                        spaceAggregation: avg
+                        timeAggregation: avg
+                    stepInterval: 1m
+            op: "2" # "<" - verificat practic (vezi documentația, "Probleme întâlnite")
+            target: 1
+            matchType: "1"
+          labels:
+            severity: critical
+          annotations:
+            description: "Cel putin o componenta monitorizata (Kafka/Keycloak/PostgreSQL) nu raspunde la scraping de metrici de peste 5 minute."
+            summary: "Componenta este indisponibila"
+          preferredChannels:
+            - monitorizare-infra-01
+          disabled: false
+        status_code: 200
+      when: signoz_rules_check.json.data.rules | selectattr('alert', 'equalto', 'Componenta indisponibila (Kafka/Keycloak/PostgreSQL)') | list | length == 0
+
+    # UI-ul SigNoz (portul 3301 al containerului) rămâne HTTP simplu - nginx
+    # dedicat, separat de cel bundle-uit în GitLab (Omnibus, care ocupă deja
+    # 80/443 pe acest host), termină TLS cu certificatul Vault emis mai sus și
+    # face proxy către localhost:3301. Port dedicat ({{ signoz_https_port }}),
+    # nu 443 - evită orice conflict cu nginx-ul GitLab.
+    - name: Instalează nginx (reverse-proxy TLS dedicat pentru UI SigNoz)
+      ansible.builtin.apt:
+        name: nginx
+        state: present
+        update_cache: true
+
+    # Site-ul implicit ascultă pe portul 80, deja ocupat de nginx-ul GitLab -
+    # ar împiedica pornirea serviciului nginx nou-instalat.
+    - name: Dezactivează site-ul implicit nginx
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: Repornește nginx SigNoz
+
+    - name: Scrie configurația vhost-ului SigNoz (TLS, port dedicat)
+      ansible.builtin.copy:
+        dest: /etc/nginx/sites-available/signoz.conf
+        content: |
+          server {
+              listen {{ signoz_https_port }} ssl;
+              server_name {{ signoz_hostname }};
+
+              ssl_certificate     {{ signoz_certs_dir }}/signoz.crt;
+              ssl_certificate_key {{ signoz_certs_dir }}/signoz.key;
+
+              location / {
+                  proxy_pass http://127.0.0.1:3301;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+              }
+          }
+        mode: "0644"
+      notify: Repornește nginx SigNoz
+
+    - name: Activează vhost-ul SigNoz
+      ansible.builtin.file:
+        src: /etc/nginx/sites-available/signoz.conf
+        dest: /etc/nginx/sites-enabled/signoz.conf
+        state: link
+      notify: Repornește nginx SigNoz
+
+    - name: Pornește și activează nginx la boot
+      ansible.builtin.systemd:
+        name: nginx
+        state: started
+        enabled: true
+
+    - name: Adaugă {{ signoz_hostname }} în /etc/hosts (mașina de control)
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        line: "10.10.10.20 {{ signoz_hostname }}"
+        regexp: "signoz\\.kube-dev\\.local$"
+      delegate_to: localhost
+      become: true
+
+  handlers:
+    - name: Repornește nginx SigNoz
+      ansible.builtin.systemd:
+        name: nginx
+        state: restarted

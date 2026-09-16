@@ -1,0 +1,24 @@
+---
+- import_playbook: playbooks/create_admin_user.yml
+- import_playbook: playbooks/update_system.yml
+- import_playbook: playbooks/install_vault.yml
+- import_playbook: playbooks/configure_vault_pki.yml
+- import_playbook: playbooks/configure_vault_users.yml
+- import_playbook: playbooks/configure_vault_admin_user.yml
+- import_playbook: playbooks/install_nfs_server.yml
+
+- import_playbook: playbooks/install_gitlab.yml
+- import_playbook: playbooks/bootstrap_gitlab_api.yml
+- import_playbook: playbooks/configure_gitlab_appadm_user.yml
+- import_playbook: playbooks/push_demo_app_source.yml
+- import_playbook: playbooks/push_demo_app_manifests.yml
+- import_playbook: playbooks/install_docker.yml
+- import_playbook: playbooks/install_signoz.yml
+
+# Generează secretul webhook și configurează webhook-ul în GitLab - complet
+# independent de kubernetes_cluster (GitLab nu testează conectivitatea la
+# crearea unui webhook, doar o stochează; verificarea reală are loc abia
+# când un eveniment chiar se trimite). Clusterul (kubernetes_cluster/k3s/
+# playbooks/15_install_monitoring.yml) doar CITEȘTE acest secret, deja scris
+# aici în Vault, ca să valideze evenimentele primite.
+- import_playbook: playbooks/configure_gitlab_ci_webhook.yml

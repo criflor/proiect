@@ -1,0 +1,53 @@
+---
+# Creează useri "aplicativi" în Vault (KV v2, calea "secret/users/") -
+# credențiale generice, nelegate de un sistem anume, disponibile pentru
+# orice serviciu/aplicație viitoare care are nevoie de un cont de
+# administrare propriu, fără să mai inventeze un alt loc de stocare. Rulează
+# imediat după configurarea Vault-ului (root CA + intermediate CA, KV v2) -
+# aceeași ordine "Vault primul", vezi site.yml.
+- name: Configurare useri aplicativi în Vault
+  hosts: suport
+  become: true
+
+  vars:
+    # Rulează pe chiar hostul Vault-ului - listener-ul intern de bootstrap
+    # (plain HTTP, doar loopback), la fel ca install_vault.yml/configure_vault_pki.yml.
+    vault_addr: "http://127.0.0.1:8201"
+    vault_user_path: secret/data/users/appadm
+
+  tasks:
+    - name: Citește tokenul root Vault
+      ansible.builtin.slurp:
+        src: "{{ vault_init_file }}"
+      register: vault_root_read
+      delegate_to: localhost
+      become: false
+
+    - name: Verifică dacă userul "appadm" există deja în Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/{{ vault_user_path }}"
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        status_code: [200, 404]
+      register: appadm_check
+
+    - name: Generează parola userului "appadm" (doar dacă lipsește din Vault)
+      ansible.builtin.command:
+        cmd: openssl rand -base64 18
+      register: appadm_password_gen
+      when: appadm_check.status == 404
+
+    - name: Scrie userul "appadm" în Vault (o singură dată)
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/{{ vault_user_path }}"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        body_format: json
+        body:
+          data:
+            username: appadm
+            password: "{{ appadm_password_gen.stdout }}"
+        status_code: 200
+      when: appadm_password_gen is not skipped
+      no_log: true

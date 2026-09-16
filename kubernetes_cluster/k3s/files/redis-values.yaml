@@ -1,0 +1,28 @@
+# Instanță unică (nu replication/sentinel) - decizie confirmată în
+# documentație: resursele clusterului (2GiB RAM/nod) nu permit HA veritabil
+# la scara acestui exercițiu.
+architecture: standalone
+
+auth:
+  enabled: true
+  password: "" # generată de chart dacă e goală, stocată în Secret-ul "redis"
+
+master:
+  persistence:
+    enabled: true
+    storageClass: local-path
+    size: 1Gi
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+
+# Fără componente suplimentare (metrics exporter, network policy proprie a
+# chart-ului) - Cilium acoperă deja politicile de rețea la nivel de cluster.
+metrics:
+  enabled: false
+networkPolicy:
+  enabled: false

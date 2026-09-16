@@ -1,0 +1,66 @@
+---
+# Creează DOAR Secret-ul de pull pentru registry-ul GitLab (folosind deploy
+# token-ul cu domeniu minim, read_registry) - imaginea vine din registry
+# (cerința 6), nu mai e importată local în containerd. Manifestele
+# aplicației (ConfigMap, PVC, Deployment) NU se mai aplică de aici - le
+# sincronizează Argo CD din repo-ul separat demo-app-manifests (cerințele
+# 7-8, vezi 13_install_argocd.yml); Secret-ul de aici nu poate fi gestionat
+# prin GitOps (ar însemna să comitem credențiale de registry în git).
+#
+# Creat identic în ambele namespace-uri (producție + dev) - fiecare rulează
+# propriile pod-uri, care au nevoie de propriul Secret de pull local.
+#
+# Namespace-urile sunt create aici (nu doar prin "CreateNamespace=true" al
+# Argo CD, care rulează mai târziu, la pasul 13) - Secret-ul de pull trebuie
+# să existe ÎNAINTE ca Argo CD să aplice Deployment-ul aplicației, altfel
+# primele pod-uri ar eșua cu "secret not found" chiar la primul sync.
+- name: Creare Secret de pull pentru registry-ul GitLab
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+
+  vars:
+    kubeconfig: "{{ local_kubeconfig_path }}"
+    vault_registry_deploy_token_path: secret/data/gitlab/registry_deploy_token
+    demo_app_namespaces:
+      - demo-app
+      - demo-app-dev
+
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+
+  tasks:
+    - name: Aplică namespace-urile aplicației demo (producție + dev, idempotent)
+      ansible.builtin.shell:
+        cmd: "kubectl create namespace {{ item }} --dry-run=client -o yaml | kubectl apply -f -"
+      register: ns_apply
+      changed_when: "'unchanged' not in ns_apply.stdout"
+      loop: "{{ demo_app_namespaces }}"
+
+    - name: Citește tokenul root Vault
+      ansible.builtin.slurp:
+        src: "{{ vault_init_file }}"
+      register: vault_root_read
+
+    - name: Citește deploy token-ul (username + token) din Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/{{ vault_registry_deploy_token_path }}"
+        validate_certs: false
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+      register: deploy_token_read
+      no_log: true
+
+    - name: Creează/actualizează Secret-ul de pull pentru registry
+      ansible.builtin.shell:
+        cmd: >
+          kubectl -n {{ item }} create secret docker-registry gitlab-registry-pull
+          --docker-server=gitlab.kube-dev.local:5050
+          --docker-username={{ deploy_token_read.json.data.data.username | quote }}
+          --docker-password={{ deploy_token_read.json.data.data.token | quote }}
+          --dry-run=client -o yaml | kubectl apply -f -
+      register: pull_secret_apply
+      changed_when: "'unchanged' not in pull_secret_apply.stdout"
+      loop: "{{ demo_app_namespaces }}"
+      no_log: true

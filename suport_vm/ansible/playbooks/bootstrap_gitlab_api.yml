@@ -1,0 +1,137 @@
+---
+# Configurează, prin API-ul GitLab, tot ce a fost făcut manual în timpul
+# depanării: un token de acces personal pentru automatizare și token-ul de
+# autentificare al GitLab Runner-ului din cluster. Complet idempotent -
+# fiecare element se creează o singură dată (verificat în Vault, singurul
+# loc unde există aceste secrete - nu mai există fișiere locale intermediare).
+#
+# Niciun proiect ("demo-app", "demo-app-manifests") nu se mai creează aici -
+# vezi configure_gitlab_appadm_user.yml, care le creează pe amândouă direct
+# sub userul "appadm", nu sub root (deploy token-urile lor sunt create tot
+# acolo, o dată ce se știe calea finală a proiectelor).
+- name: Generare token de automatizare GitLab
+  hosts: suport
+  become: true
+
+  vars:
+    vault_secret_path: secret/data/gitlab/automation_token
+
+  tasks:
+    - name: Citește tokenul root Vault
+      ansible.builtin.slurp:
+        src: "{{ vault_init_file }}"
+      register: vault_root_read
+      delegate_to: localhost
+      become: false
+
+    - name: Verifică dacă token-ul de automatizare există deja în Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/{{ vault_secret_path }}"
+        validate_certs: false
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        status_code: [200, 404]
+      register: automation_token_check
+
+    # Un Personal Access Token pentru userul root, cu scope-urile necesare
+    # automatizării (creare proiecte, push în git, push în registry).
+    - name: Generează token-ul de acces personal (o singură dată)
+      ansible.builtin.shell:
+        cmd: >
+          gitlab-rails runner "
+          token = User.find_by_username('root').personal_access_tokens.create(
+            name: 'automation',
+            scopes: [:api, :write_repository, :read_registry, :write_registry],
+            expires_at: 365.days.from_now
+          );
+          token.save!;
+          puts token.token
+          " | tail -1
+      register: automation_token_gen
+      when: automation_token_check.status == 404
+      no_log: true
+
+    - name: Scrie token-ul de automatizare în Vault (o singură dată)
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/{{ vault_secret_path }}"
+        validate_certs: false
+        method: POST
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        body_format: json
+        body:
+          data:
+            value: "{{ automation_token_gen.stdout }}"
+        status_code: 200
+      when: automation_token_gen is not skipped
+      no_log: true
+
+- name: Configurare proiect demo-app și token GitLab Runner (via API)
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+
+  vars:
+    gitlab_hostname: gitlab.kube-dev.local
+    runner_description: k3s-kubernetes-executor-runner
+    vault_automation_token_path: secret/data/gitlab/automation_token
+    vault_runner_token_path: secret/data/gitlab/runner_token
+
+  tasks:
+    - name: Citește tokenul root Vault
+      ansible.builtin.slurp:
+        src: "{{ vault_init_file }}"
+      register: vault_root_read
+
+    - name: Citește token-ul de automatizare din Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/{{ vault_automation_token_path }}"
+        validate_certs: false
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+      register: automation_token_read
+      no_log: true
+
+    - name: Verifică dacă token-ul GitLab Runner există deja în Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/{{ vault_runner_token_path }}"
+        validate_certs: false
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        status_code: [200, 404]
+      register: runner_token_check
+
+    # Flux modern (GitLab 16+): un token de autentificare pentru runner, nu
+    # un secret comun de înregistrare (eliminat din GitLab).
+    - name: Creează token-ul de autentificare pentru GitLab Runner (o singură dată)
+      ansible.builtin.uri:
+        url: "https://{{ gitlab_hostname }}/api/v4/user/runners"
+        method: POST
+        headers:
+          PRIVATE-TOKEN: "{{ automation_token_read.json.data.data.value }}"
+        body_format: form-urlencoded
+        body:
+          runner_type: instance_type
+          description: "{{ runner_description }}"
+          run_untagged: true
+        validate_certs: false
+        status_code: 201
+      register: runner_create
+      when: runner_token_check.status == 404
+      no_log: true
+
+    - name: Scrie token-ul GitLab Runner în Vault (o singură dată)
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/{{ vault_runner_token_path }}"
+        validate_certs: false
+        method: POST
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        body_format: json
+        body:
+          data:
+            value: "{{ runner_create.json.token }}"
+        status_code: 200
+      when: runner_create is not skipped
+      no_log: true

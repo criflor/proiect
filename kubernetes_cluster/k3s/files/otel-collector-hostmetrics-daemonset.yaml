@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: otel-collector-hostmetrics
+  namespace: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: otel-collector-hostmetrics
+  template:
+    metadata:
+      labels:
+        app: otel-collector-hostmetrics
+    spec:
+      serviceAccountName: otel-collector
+      # hostNetwork - kubelet-ul locală ascultă doar pe IP-ul nodului, nu pe
+      # o interfață accesibilă din rețeaua de pod-uri Cilium.
+      hostNetwork: true
+      containers:
+        - name: otel-collector
+          image: otel/opentelemetry-collector-contrib:0.160.0
+          args: ["--config=/etc/otel/config.yaml"]
+          # Fișierele de log din /var/log/pods sunt deținute de root, fără
+          # acces de citire pentru alți utilizatori (verificat practic) - are
+          # nevoie de root doar pentru a le citi, nu scrie nimic pe disc.
+          securityContext:
+            runAsUser: 0
+          env:
+            - name: K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: config
+              mountPath: /etc/otel
+            - name: ca-cert
+              mountPath: /etc/otel-ca
+            - name: varlogpods
+              mountPath: /var/log/pods
+              readOnly: true
+            - name: varlogcontainers
+              mountPath: /var/log/containers
+              readOnly: true
+            # Rădăcina reală a nodului, necesară scraper-ului "filesystem" al
+            # hostmetrics ("root_path: /hostfs" în config.yaml) - fără el,
+            # scraper-ul vede doar rootfs-ul izolat al containerului, nu
+            # discurile reale ale nodului.
+            - name: hostfs
+              mountPath: /hostfs
+              readOnly: true
+              mountPropagation: HostToContainer
+          resources:
+            requests:
+              cpu: 30m
+              memory: 96Mi
+            limits:
+              cpu: 150m
+              memory: 192Mi
+      volumes:
+        - name: config
+          configMap:
+            name: otel-collector-hostmetrics-config
+        - name: ca-cert
+          configMap:
+            name: otel-collector-ca
+        - name: varlogpods
+          hostPath:
+            path: /var/log/pods
+        - name: varlogcontainers
+          hostPath:
+            path: /var/log/containers
+        - name: hostfs
+          hostPath:
+            path: /

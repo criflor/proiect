@@ -1,0 +1,70 @@
+# bitnami/keycloak nu mai are tag-uri publicate pe Docker Hub (migrat spre
+# catalogul plătit "Bitnami Secure Images") - tag-urile vechi, gratuite,
+# rămân disponibile doar sub "bitnamilegacy/". Deși repo-ul "bitnami/postgresql"
+# per ansamblu e încă activ, tag-ul exact cerut de acest chart
+# (17.6.0-debian-12-r0) a fost eliminat și el - verificat via API Docker Hub că
+# există doar sub "bitnamilegacy/postgresql", deci are nevoie de aceeași
+# corecție (mai jos, la postgresql.image).
+image:
+  repository: bitnamilegacy/keycloak
+
+# Instanță unică (implicit în chart) - decizie confirmată: fără resurse
+# pentru HA real la scara acestui exercițiu. Baza de date PostgreSQL vine din
+# subchart-ul bundle (persistență proprie, separată de cea a demo-app).
+replicaCount: 1
+
+auth:
+  adminUser: admin
+  adminPassword: "" # generată de chart, stocată în Secret
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 512Mi
+  limits:
+    cpu: 500m
+    memory: 768Mi
+
+postgresql:
+  enabled: true
+  image:
+    repository: bitnamilegacy/postgresql
+  auth:
+    password: "" # generată de chart, stocată în Secret
+  primary:
+    persistence:
+      enabled: true
+      storageClass: local-path
+      size: 1Gi
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 250m
+        memory: 256Mi
+  # Exporter Prometheus pentru baza de date internă (cerința 10) - sidecar
+  # separat, resurse minime.
+  metrics:
+    enabled: true
+    image:
+      repository: bitnamilegacy/postgres-exporter
+    resources:
+      requests:
+        cpu: 10m
+        memory: 32Mi
+      limits:
+        cpu: 50m
+        memory: 64Mi
+
+# Metrici Keycloak (Quarkus/Micrometer) pentru colectorul OTel din cluster
+# (cerința 10) - endpoint intern, fără sidecar suplimentar.
+metrics:
+  enabled: true
+networkPolicy:
+  enabled: false
+
+# Rulează în spatele Gateway-ului (terminare TLS acolo, ca la Argo CD/Hubble) -
+# Keycloak nu are nevoie de propriul certificat.
+httpRelativePath: "/"
+proxyHeaders: "xforwarded"

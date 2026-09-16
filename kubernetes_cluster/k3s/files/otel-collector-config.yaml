@@ -1,0 +1,149 @@
+receivers:
+  # Trace-uri și metrici trimise direct de demo-app (instrumentare OTel), plus
+  # orice altă sursă viitoare care vorbește nativ OTLP.
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+  # Metrici la nivel de cluster (stare noduri/pod-uri/deployment-uri) direct
+  # din API-ul Kubernetes - nu necesită kube-state-metrics separat.
+  k8s_cluster:
+    auth_type: serviceAccount
+    collection_interval: 30s
+
+  # Metrici de topologie/business Kafka (brokeri, partiții, replicare, lag
+  # consumatori) - complementare JMX-ului de mai jos (acela expune metrici de
+  # performanță internă JVM/broker, nu structura clusterului). Se conectează
+  # direct la Kafka, ca un client obișnuit, fără sidecar suplimentar.
+  kafka_metrics:
+    brokers: ["kafka.kafka.svc.cluster.local:9092"]
+    protocol_version: "3.0.0"
+    scrapers: [brokers, topics, consumers]
+    collection_interval: 30s
+    # Fără "cluster_alias" explicit, dashboard-ul predefinit "Kafka Server
+    # Monitoring" din SigNoz nu poate filtra deloc datele - avertizează chiar
+    # el explicit: "label kafka.cluster.alias not found in metadata"
+    # (verificat practic - vezi documentația, secțiunea "Probleme întâlnite").
+    cluster_alias: kube-dev
+    topic_match: ".*"
+    group_match: ".*"
+    # Câteva metrici (inclusiv chiar eticheta "kafka.cluster.alias" de mai
+    # sus, ca resource attribute) sunt dezactivate implicit în acest
+    # receiver, indiferent de valoarea "cluster_alias" setată - trebuie
+    # activate explicit (verificat direct din metadata.yaml a receiver-ului).
+    resource_attributes:
+      kafka.cluster.alias:
+        enabled: true
+    metrics:
+      kafka.broker.log_retention_period:
+        enabled: true
+      kafka.topic.replication_factor:
+        enabled: true
+      kafka.topic.log_retention_period:
+        enabled: true
+      kafka.topic.log_retention_size:
+        enabled: true
+      kafka.topic.min_insync_replicas:
+        enabled: true
+
+  # Metrici Redis (uptime, clienți conectați, memorie, hit/miss cache) -
+  # conectare directă la Redis, ca un client obișnuit, fără sidecar. Parola
+  # vine din Secret-ul generat de chart-ul Bitnami (variabilă de mediu în
+  # Deployment-ul colectorului, nu hardcodată aici).
+  redis:
+    endpoint: "redis-master.redis.svc.cluster.local:6379"
+    password: "${env:REDIS_PASSWORD}"
+    collection_interval: 30s
+
+  # Trace-uri de pipeline CI/CD GitLab (cerința 10 - observabilitate CI/CD) -
+  # mod webhook (singurul disponibil - receiver-ul nu suportă polling): GitLab
+  # trimite un HTTP POST către acest endpoint la fiecare eveniment de
+  # pipeline/job. Expus în afara clusterului prin Gateway (vezi HTTPRoute
+  # dedicat), cu validare prin token secret (nu doar un endpoint deschis).
+  gitlab:
+    webhook:
+      endpoint: 0.0.0.0:8081
+      path: /events
+      health_path: /health
+      secret: "${env:GITLAB_WEBHOOK_SECRET}"
+
+  # Kafka, Keycloak, PostgreSQL și ArgoCD expun metrici doar în format
+  # Prometheus (nu vorbesc nativ OTLP) - acest receiver le culege prin
+  # scraping și le convertește intern în OTLP înainte de exportul final.
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: kafka
+          scrape_interval: 30s
+          static_configs:
+            - targets: ["kafka-jmx-metrics.kafka.svc.cluster.local:5556"]
+        - job_name: keycloak
+          scrape_interval: 30s
+          static_configs:
+            - targets: ["keycloak-metrics.keycloak.svc.cluster.local:9000"]
+        - job_name: keycloak-postgresql
+          scrape_interval: 30s
+          static_configs:
+            - targets: ["keycloak-postgresql-metrics.keycloak.svc.cluster.local:9187"]
+        # Metrici dezactivate implicit în chart-ul ArgoCD (fără niciun
+        # Service dedicat) - activate explicit în argocd-values.yaml
+        # (§k3s/playbooks/13_install_argocd.yml), pentru dashboard-ul
+        # predefinit ArgoCD din SigNoz ("argocd_app_info" etc.).
+        - job_name: argocd-application-controller
+          scrape_interval: 30s
+          static_configs:
+            - targets: ["argocd-application-controller-metrics.argocd.svc.cluster.local:8082"]
+        - job_name: argocd-server
+          scrape_interval: 30s
+          static_configs:
+            - targets: ["argocd-server-metrics.argocd.svc.cluster.local:8083"]
+        - job_name: argocd-repo-server
+          scrape_interval: 30s
+          static_configs:
+            - targets: ["argocd-repo-server-metrics.argocd.svc.cluster.local:8084"]
+
+processors:
+  batch: {}
+  # Etichetează fiecare metrică/trace cu numele clusterului - util odată ce
+  # SigNoz colectează eventual de la mai multe surse.
+  resource:
+    attributes:
+      - key: k8s.cluster.name
+        value: kube-dev
+        action: upsert
+      # Câteva dashboard-uri predefinite din SigNoz (ex. "Kafka Server
+      # Monitoring") filtrează explicit după această etichetă convențională
+      # OTel - fără ea, avertizează "label deployment.environment not found
+      # in metadata" și nu afișează nimic, chiar dacă datele de bază există.
+      - key: deployment.environment
+        value: dev
+        action: upsert
+
+exporters:
+  # Colectorul din SigNoz de pe VM-ul de suport - singurul punct de ieșire
+  # din cluster pentru toată telemetria (cerința 10: colectare via OTLP).
+  # TLS obligatoriu - receiver-ul gRPC al ingester-ului SigNoz prezintă un
+  # certificat emis de Vault PKI (kubernetes_cluster/k3s/files/gitlab-kube-dev-local-ca.crt
+  # e rădăcina de încredere, aceeași folosită pentru tot restul serviciilor -
+  # vezi suport_vm/ansible/playbooks/install_signoz.yml). Certificatul are
+  # explicit IP SAN pentru 10.10.10.20 (conexiunea se face pe IP, nu pe
+  # hostname, din interiorul clusterului), la fel ca certificatul propriu al
+  # Vault-ului (§13).
+  otlp_grpc:
+    endpoint: 10.10.10.20:4317
+    tls:
+      ca_file: /etc/otel-ca/ca.crt
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp, gitlab]
+      processors: [resource, batch]
+      exporters: [otlp_grpc]
+    metrics:
+      receivers: [otlp, k8s_cluster, prometheus, kafka_metrics, redis]
+      processors: [resource, batch]
+      exporters: [otlp_grpc]

@@ -1,0 +1,111 @@
+# Pipeline CI/CD: construiește imaginea cu Kaniko (fără daemon Docker/podman,
+# potrivit pentru rulare în pod-uri Kubernetes, prin GitLab Runner), o
+# publică în registry-ul privat integrat GitLab, apoi (doar pe branch-ul
+# implicit) deschide automat un Merge Request pe repo-ul separat de
+# manifeste (demo-app-manifests) cu noul tag - închide bucla GitOps
+# (commit -> imagine nouă -> MR cu tag-ul corect -> aprobare umană -> Argo CD
+# sincronizează), fără pasul manual de editare a app.yaml.
+#
+# Declanșare: la fiecare push pe orice branch și la fiecare tag Git.
+# Versionare imagine:
+#   - întotdeauna: tag-ul scurt al commit-ului ($CI_COMMIT_SHORT_SHA) - urmărire exactă a sursei
+#   - dacă push-ul e un tag Git (ex. v1.2.3): imaginea primește ȘI acel tag - versiune de release
+#   - dacă branch-ul e cel implicit (main): imaginea primește și tag-ul "latest"
+stages:
+  - build
+  - update-manifests
+
+build:
+  stage: build
+  image:
+    name: gcr.io/kaniko-project/executor:v1.23.2-debug
+    entrypoint: [""]
+  script:
+    - mkdir -p /kaniko/.docker
+    - >
+      echo "{\"auths\":{\"${CI_REGISTRY}\":{\"auth\":\"$(printf '%s:%s' "${CI_REGISTRY_USER}" "${CI_REGISTRY_PASSWORD}" | base64 | tr -d '\n')\"}}}" > /kaniko/.docker/config.json
+    - |
+      DESTINATIONS="--destination ${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA}"
+      if [ -n "${CI_COMMIT_TAG}" ]; then
+        DESTINATIONS="${DESTINATIONS} --destination ${CI_REGISTRY_IMAGE}:${CI_COMMIT_TAG}"
+      fi
+      if [ "${CI_COMMIT_BRANCH}" = "${CI_DEFAULT_BRANCH}" ]; then
+        DESTINATIONS="${DESTINATIONS} --destination ${CI_REGISTRY_IMAGE}:latest"
+      fi
+      /kaniko/executor \
+        --context "${CI_PROJECT_DIR}" \
+        --dockerfile "${CI_PROJECT_DIR}/Dockerfile" \
+        ${DESTINATIONS}
+  rules:
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+# Actualizează tag-ul imaginii în manifeste (demo-app-manifests), separat pe
+# două medii, cu politici diferite (decizie explicită):
+#   - branch implicit (main)  -> overlays/prod, branch "main" al manifestelor,
+#     DOAR prin Merge Request aprobat manual (cerința 8, neschimbat).
+#   - orice alt branch        -> overlays/dev, branch "dev" al manifestelor
+#     (neprotejat), push direct, FĂRĂ Merge Request - buclă rapidă de
+#     dezvoltare; "dev" e mereu resetat la ultimul "main" + tag-ul curent
+#     (push forțat), un singur mediu de dev comun, nu unul per branch.
+# APPADM_TOKEN (write_repository) - doar pentru push în git;
+# MANIFESTS_AUTOMATION_TOKEN (scope "api") - pentru API-ul de Merge Request,
+# care respinge un token cu scope prea restrâns (verificat practic).
+# Variabilele sunt setate pe acest proiect de
+# suport_vm/ansible/playbooks/configure_gitlab_appadm_user.yml, citite din
+# Vault - nu apar niciodată în clar în acest fișier.
+update-manifests:
+  stage: update-manifests
+  image: alpine:latest
+  variables:
+    GIT_STRATEGY: none
+    MANIFESTS_REPO: appadm/demo-app-manifests
+    MANIFESTS_CA_CERT: /kaniko/ssl/certs/additional-ca-cert-bundle.crt
+  script:
+    - apk add --no-cache git curl
+    - git config --global http.sslCAInfo "${MANIFESTS_CA_CERT}"
+    - git config --global user.email "appadm@kube-dev.local"
+    - git config --global user.name "appadm"
+    - |
+      if [ "${CI_COMMIT_BRANCH}" = "${CI_DEFAULT_BRANCH}" ]; then
+        OVERLAY="overlays/prod"
+        USE_MR="true"
+      else
+        OVERLAY="overlays/dev"
+        USE_MR="false"
+      fi
+
+      git clone "https://appadm:${APPADM_TOKEN}@${CI_SERVER_HOST}/${MANIFESTS_REPO}.git" manifests
+      cd manifests
+
+      # Pornim mereu de la ultima stare a "main" (structura de bază/overlay-uri
+      # e întreținută acolo de suport_vm/ansible/playbooks/push_demo_app_manifests.yml)
+      # - inclusiv pentru "dev", ca să preia orice schimbare structurală
+      # aprobată deja pe "main", nu doar tag-ul de imagine.
+      git fetch origin main
+      WORK_BRANCH="image-update-${CI_COMMIT_SHORT_SHA}"
+      git checkout -B "${WORK_BRANCH}" FETCH_HEAD
+
+      sed -i "s#^\( *newTag: \).*#\1${CI_COMMIT_SHORT_SHA}#" "${OVERLAY}/kustomization.yaml"
+      if git diff --quiet; then
+        echo "Tag-ul e deja cel corect - nimic de propus."
+        exit 0
+      fi
+      git add "${OVERLAY}/kustomization.yaml"
+      git commit -m "Actualizare imagine demo-app (${OVERLAY}) la ${CI_COMMIT_SHORT_SHA}"
+
+      if [ "${USE_MR}" = "true" ]; then
+        git push "https://appadm:${APPADM_TOKEN}@${CI_SERVER_HOST}/${MANIFESTS_REPO}.git" "HEAD:${WORK_BRANCH}"
+        curl -sS --cacert "${MANIFESTS_CA_CERT}" \
+          -X POST "https://${CI_SERVER_HOST}/api/v4/projects/$(echo -n "${MANIFESTS_REPO}" | sed 's#/#%2F#')/merge_requests" \
+          -H "PRIVATE-TOKEN: ${MANIFESTS_AUTOMATION_TOKEN}" \
+          --data-urlencode "source_branch=${WORK_BRANCH}" \
+          --data-urlencode "target_branch=main" \
+          --data-urlencode "title=Actualizare imagine demo-app -> ${CI_COMMIT_SHORT_SHA}" \
+          --data-urlencode "remove_source_branch=true" \
+          --fail-with-body
+      else
+        git push --force "https://appadm:${APPADM_TOKEN}@${CI_SERVER_HOST}/${MANIFESTS_REPO}.git" "HEAD:dev"
+      fi
+  rules:
+    - if: $CI_COMMIT_BRANCH

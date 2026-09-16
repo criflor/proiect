@@ -1,0 +1,25 @@
+# ClusterIssuer-ul folosit efectiv de aplicații (via adnotare
+# cert-manager.io/cluster-issuer: kube-dev-ca-issuer pe Ingress/Gateway) -
+# certificatele vin acum din Vault PKI (intermediate CA "pki_int", rolul
+# "kube-dev" - vezi suport_vm/ansible/playbooks/configure_vault_pki.yml),
+# nu dintr-un CA local self-signed. Autentificarea cert-manager -> Vault se
+# face prin Kubernetes auth (vezi playbooks/16_configure_vault_pki_auth.yml,
+# care creează Secret-ul "cert-manager-vault-token" referențiat mai jos și
+# rolul Vault "cert-manager"). Rulează DUPĂ playbook-ul 16 (numerotarea nu
+# reflectă ordinea - vezi comentariul din site.yml) - până atunci,
+# cert-manager reîncearcă automat, fără nicio intervenție manuală.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: kube-dev-ca-issuer
+spec:
+  vault:
+    server: http://10.10.10.20:8200
+    path: pki_int/sign/kube-dev
+    auth:
+      kubernetes:
+        role: cert-manager
+        mountPath: /v1/auth/kubernetes
+        secretRef:
+          name: cert-manager-vault-token
+          key: token

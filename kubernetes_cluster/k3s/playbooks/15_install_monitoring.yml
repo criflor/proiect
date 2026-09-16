@@ -1,0 +1,178 @@
+---
+# Colectoare OpenTelemetry în cluster (cerința 10 - monitorizare):
+#   1. Un Deployment "gateway" - culege metrici de STARE la nivel de cluster
+#      (API Kubernetes), de la Kafka/Keycloak/PostgreSQL (scraping Prometheus,
+#      convertit intern în OTLP) și primește direct trace-uri OTLP de la
+#      demo-app.
+#   2. Un DaemonSet - un pod pe FIECARE nod, cu metrici reale de utilizare
+#      hardware (CPU/memorie/disc/rețea, "hostmetrics") și utilizare per
+#      pod/container citită direct de la kubelet-ul local ("kubeletstats") -
+#      fără el, secțiunea "Hosts"/"Infrastructure" din SigNoz rămâne goală
+#      (starea obiectelor din Deployment-ul de mai sus nu e același lucru cu
+#      utilizarea efectivă a resurselor - verificat practic).
+# Ambele exportă, tot via OTLP, către SigNoz de pe VM-ul de suport (§ separat,
+# suport_vm/ansible).
+- name: Instalare colector OpenTelemetry în cluster
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+
+  vars:
+    kubeconfig: "{{ local_kubeconfig_path }}"
+    # Rădăcina PKI Vault, aceeași folosită pentru încrederea în orice alt
+    # serviciu al proiectului (GitLab, Gateway) - sincronizată de
+    # suport_vm/ansible/playbooks/configure_vault_pki.yml. Colectorul din
+    # cluster o folosește ca să valideze certificatul TLS al ingester-ului
+    # SigNoz (§13, §10).
+    root_ca_file: "{{ playbook_dir }}/../files/gitlab-kube-dev-local-ca.crt"
+
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+
+  tasks:
+    - name: Aplică namespace-ul "monitoring" (idempotent)
+      ansible.builtin.shell:
+        cmd: kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
+      register: monitoring_ns_apply
+      changed_when: "'unchanged' not in monitoring_ns_apply.stdout"
+
+    - name: Creează RBAC-ul colectorului (ServiceAccount + ClusterRole)
+      ansible.builtin.command:
+        cmd: kubectl apply -f {{ playbook_dir }}/../files/otel-collector-rbac.yaml
+      register: otel_rbac_apply
+      changed_when: "'unchanged' not in otel_rbac_apply.stdout"
+
+    # Secret-ul cu parola Redis trăiește în namespace-ul "redis" (generat de
+    # chart-ul Bitnami) - un Secret Kubernetes nu poate fi referențiat direct
+    # cross-namespace, de aceea e "oglindit" explicit aici, cu doar valoarea
+    # de care are nevoie colectorul (nu tot Secret-ul original).
+    - name: Oglindește parola Redis în namespace-ul "monitoring" (pentru receiver-ul "redis")
+      ansible.builtin.shell:
+        cmd: >
+          kubectl create secret generic redis-password-mirror
+          --namespace monitoring
+          --from-literal=redis-password=$(kubectl -n redis get secret redis -o jsonpath='{.data.redis-password}' | base64 -d)
+          --dry-run=client -o yaml | kubectl apply -f -
+      register: redis_secret_mirror_apply
+      changed_when: "'unchanged' not in redis_secret_mirror_apply.stdout"
+      no_log: true
+
+    # Token folosit de GitLab pentru a semna evenimentele webhook (header
+    # "X-Gitlab-Token") - receiver-ul "gitlab" îl verifică la fiecare cerere,
+    # ca endpoint-ul expus public (prin Gateway) să nu accepte orice request.
+    # Generat pe suport_vm (suport_vm/ansible/playbooks/configure_gitlab_ci_webhook.yml),
+    # NU aici - clusterul trebuie să poată fi construit independent de
+    # suport_vm sau invers, fără o dependență circulară de generare; aici se
+    # doar CITEȘTE valoarea deja existentă în Vault.
+    - name: Citește tokenul root Vault
+      ansible.builtin.slurp:
+        src: "{{ vault_init_file }}"
+      register: vault_root_read
+
+    - name: Verifică dacă secretul webhook GitLab există deja în Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/secret/data/gitlab/webhook_secret"
+        validate_certs: false
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        status_code: [200, 404]
+      register: gitlab_webhook_secret_check
+
+    - name: Eșuează explicit dacă secretul webhook nu există încă
+      ansible.builtin.fail:
+        msg: >-
+          Secretul secret/gitlab/webhook_secret nu există în Vault. Rulează
+          întâi suport_vm/ansible/playbooks/configure_gitlab_ci_webhook.yml
+          (sau site.yml complet al suport_vm) - acolo se generează, nu aici.
+      when: gitlab_webhook_secret_check.status == 404
+
+    - name: Citește secretul webhook GitLab din Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/secret/data/gitlab/webhook_secret"
+        validate_certs: false
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+      register: gitlab_webhook_secret_read
+      no_log: true
+
+    - name: Creează Secret-ul Kubernetes cu token-ul webhook GitLab
+      ansible.builtin.shell:
+        cmd: >
+          kubectl create secret generic gitlab-webhook-secret
+          --namespace monitoring
+          --from-literal=secret={{ gitlab_webhook_secret_read.json.data.data.value }}
+          --dry-run=client -o yaml | kubectl apply -f -
+      register: gitlab_webhook_k8s_secret_apply
+      changed_when: "'unchanged' not in gitlab_webhook_k8s_secret_apply.stdout"
+      no_log: true
+
+    - name: Aplică HTTPRoute-ul webhook-ului GitLab (expunere prin Gateway)
+      ansible.builtin.command:
+        cmd: kubectl apply -f {{ playbook_dir }}/../files/otel-collector-gitlab-httproute.yaml
+      register: gitlab_httproute_apply
+      changed_when: "'unchanged' not in gitlab_httproute_apply.stdout"
+
+    - name: Aplică/actualizează configurația colectorului OTel (ConfigMap)
+      ansible.builtin.shell:
+        cmd: >
+          kubectl create configmap otel-collector-config
+          --namespace monitoring
+          --from-file=config.yaml={{ playbook_dir }}/../files/otel-collector-config.yaml
+          --dry-run=client -o yaml | kubectl apply -f -
+      register: otel_config_apply
+      changed_when: "'unchanged' not in otel_config_apply.stdout"
+
+    - name: Aplică/actualizează CA-ul PKI (ConfigMap, pentru validarea TLS a ingester-ului SigNoz)
+      ansible.builtin.shell:
+        cmd: >
+          kubectl create configmap otel-collector-ca
+          --namespace monitoring
+          --from-file=ca.crt={{ root_ca_file }}
+          --dry-run=client -o yaml | kubectl apply -f -
+      register: otel_ca_apply
+      changed_when: "'unchanged' not in otel_ca_apply.stdout"
+
+    - name: Instalează Deployment-ul și Service-ul colectorului OTel
+      ansible.builtin.command:
+        cmd: kubectl apply -f {{ playbook_dir }}/../files/otel-collector-deployment.yaml
+      register: otel_deploy_apply
+      changed_when: "'unchanged' not in otel_deploy_apply.stdout"
+
+    - name: Repornește colectorul dacă s-a schimbat configurația sau CA-ul (reîncarcă fișierele montate)
+      ansible.builtin.command:
+        cmd: kubectl -n monitoring rollout restart deployment/otel-collector
+      when: otel_config_apply.changed or otel_ca_apply.changed
+      changed_when: true
+
+    - name: Așteaptă ca deployment-ul colectorului OTel să fie disponibil
+      ansible.builtin.command:
+        cmd: kubectl -n monitoring rollout status deployment/otel-collector --timeout=180s
+      changed_when: false
+
+    - name: Aplică/actualizează configurația colectorului de host metrics (ConfigMap)
+      ansible.builtin.shell:
+        cmd: >
+          kubectl create configmap otel-collector-hostmetrics-config
+          --namespace monitoring
+          --from-file=config.yaml={{ playbook_dir }}/../files/otel-collector-hostmetrics-config.yaml
+          --dry-run=client -o yaml | kubectl apply -f -
+      register: otel_hostmetrics_config_apply
+      changed_when: "'unchanged' not in otel_hostmetrics_config_apply.stdout"
+
+    - name: Instalează DaemonSet-ul colectorului de host metrics
+      ansible.builtin.command:
+        cmd: kubectl apply -f {{ playbook_dir }}/../files/otel-collector-hostmetrics-daemonset.yaml
+      register: otel_hostmetrics_deploy_apply
+      changed_when: "'unchanged' not in otel_hostmetrics_deploy_apply.stdout"
+
+    - name: Repornește DaemonSet-ul dacă s-a schimbat configurația sau CA-ul
+      ansible.builtin.command:
+        cmd: kubectl -n monitoring rollout restart daemonset/otel-collector-hostmetrics
+      when: otel_hostmetrics_config_apply.changed or otel_ca_apply.changed
+      changed_when: true
+
+    - name: Așteaptă ca DaemonSet-ul colectorului de host metrics să fie disponibil
+      ansible.builtin.command:
+        cmd: kubectl -n monitoring rollout status daemonset/otel-collector-hostmetrics --timeout=180s
+      changed_when: false

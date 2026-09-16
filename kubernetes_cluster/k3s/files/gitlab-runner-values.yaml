@@ -1,0 +1,31 @@
+# GitLab Runner rulează ca pod în cluster (nu pe VM-ul de suport) - job-urile
+# de CI/CD pornesc pod-uri efemere folosind executorul Kubernetes, iar
+# build-ul imaginilor se face cu Kaniko (fără daemon Docker/podman, fără
+# containere privilegiate - potrivit pentru rulare în cluster).
+gitlabUrl: https://gitlab.kube-dev.local
+
+# Certificatul CA self-signed al GitLab - fără el, runner-ul nu poate clona
+# prin HTTPS și nu poate vorbi cu API-ul GitLab.
+certsSecretName: gitlab-runner-certs
+
+rbac:
+  create: true
+
+runners:
+  executor: kubernetes
+  config: |
+    [[runners]]
+      [runners.kubernetes]
+        namespace = "gitlab-runner"
+        image = "alpine:latest"
+        # Certificatul CA, montat și în interiorul pod-urilor de job (nu doar
+        # în runner-ul propriu-zis) - necesar lui Kaniko ca să aibă încredere
+        # în registry-ul GitLab la push. mount_path țintește DIRECT fișierul
+        # (nu directorul /kaniko/ssl/certs/) - altfel montarea ar ascunde tot
+        # directorul, inclusiv CA-urile publice implicite ale Kaniko, necesare
+        # ca să poată trage imagini de bază de pe Docker Hub.
+        [[runners.kubernetes.volumes.secret]]
+          name = "gitlab-runner-certs"
+          mount_path = "/kaniko/ssl/certs/additional-ca-cert-bundle.crt"
+          sub_path = "gitlab.kube-dev.local.crt"
+          read_only = true

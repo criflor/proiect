@@ -1,0 +1,100 @@
+---
+# Actualizează sistemul de operare pe toate VM-urile. Idempotent: dacă nu sunt
+# pachete noi, task-urile de apt raportează "ok" fără modificări; repornirea se
+# declanșează DOAR când kernelul/pachetele actualizate chiar o cer, ȘI numai pe
+# host-urile cu allow_reboot: true (datele - allow_reboot_default/allow_reboot_per_host -
+# vin din group_vars/all.yml; rezolvarea per-host se face aici).
+- name: Actualizare sistem de operare
+  hosts: suport
+  become: true
+
+  vars:
+    allow_reboot: "{{ allow_reboot_per_host[inventory_hostname] | default(allow_reboot_default) }}"
+
+  tasks:
+    # "needrestart" (instalat implicit pe imaginile cloud Ubuntu 24.04) intră
+    # în mod interactiv la orice "apt-get install" care atinge biblioteci
+    # partajate - cu UN dialog whiptail diferit pentru fiecare motiv posibil
+    # ("servicii de repornit", "kernel nou disponibil" etc.). Modulul
+    # ansible.builtin.apt de mai jos setează singur DEBIAN_FRONTEND=noninteractive
+    # pentru propriile task-uri, dar playbook-uri ulterioare care rulează
+    # "apt-get install" prin shell brut (ex. install_gitlab.yml, scriptul
+    # oficial curl|bash al GitLab) NU beneficiază deloc de asta - needrestart
+    # se blochează la nesfârșit așteptând un răspuns pe care nimeni nu-l poate
+    # da (verificat practic - a blocat complet o rulare a playbook-ului, de
+    # două ori, cu două dialoguri diferite).
+    #
+    # Corectat o singură dată, aici, devreme - în DOUĂ straturi:
+    #   1. Config needrestart (acoperă promptul de repornire servicii).
+    #   2. /etc/environment (acoperă ORICE dialog, indiferent de motiv - citit
+    #      automat de PAM la fiecare sesiune SSH, deci se aplică inclusiv
+    #      comenzilor shell brute din playbook-uri ulterioare, fără să fie
+    #      nevoie de "environment:" repetat pe fiecare task vulnerabil).
+    - name: Asigură existența directorului de configurare needrestart
+      ansible.builtin.file:
+        path: /etc/needrestart/conf.d
+        state: directory
+        mode: "0755"
+
+    - name: Dezactivează promptul interactiv al needrestart
+      ansible.builtin.copy:
+        content: "$nrconf{restart} = 'a';\n"
+        dest: /etc/needrestart/conf.d/no-prompt.conf
+        mode: "0644"
+
+    - name: Suprimă definitiv orice dialog needrestart, indiferent de motiv (toate sesiunile SSH ulterioare)
+      ansible.builtin.lineinfile:
+        path: /etc/environment
+        line: "{{ item }}"
+      loop:
+        - "DEBIAN_FRONTEND=noninteractive"
+        - "NEEDRESTART_MODE=a"
+
+    - name: Actualizează indexul de pachete (apt update)
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+        lock_timeout: 120
+
+    - name: Face upgrade complet al pachetelor instalate (apt dist-upgrade)
+      ansible.builtin.apt:
+        upgrade: dist
+        autoremove: true
+        autoclean: true
+        lock_timeout: 120
+      register: apt_upgrade_result
+
+    - name: Verifică dacă actualizările necesită repornirea sistemului
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required_file
+
+    # /var/run e tmpfs (golit la fiecare boot), deci citim motivul ÎNAINTE de
+    # repornire - după reboot fișierul dispare oricum, indiferent de rezultat.
+    - name: Citește motivul repornirii, înainte de a reporni
+      ansible.builtin.slurp:
+        src: /var/run/reboot-required
+      register: reboot_reason
+      when: reboot_required_file.stat.exists
+
+    - name: "Repornește sistemul (doar dacă e necesar și allow_reboot=true) și așteaptă revenirea online"
+      ansible.builtin.reboot:
+        msg: "Repornire declanșată de Ansible după actualizări de sistem"
+        reboot_timeout: 600
+        pre_reboot_delay: 5
+        post_reboot_delay: 10
+      when: reboot_required_file.stat.exists and allow_reboot | bool
+
+    - name: Confirmă motivul repornirii (informativ)
+      ansible.builtin.debug:
+        msg: "Sistemul a fost repornit: {{ reboot_reason.content | b64decode | trim }}"
+      when: reboot_required_file.stat.exists and allow_reboot | bool
+
+    - name: Avertizează dacă e necesară o repornire, dar allow_reboot este dezactivat pe acest host
+      ansible.builtin.debug:
+        msg: >-
+          ATENȚIE: sistemul necesită repornire ({{ reboot_reason.content | b64decode | trim }}),
+          dar allow_reboot este false pentru {{ inventory_hostname }} - repornirea NU a fost
+          efectuată automat. Setează allow_reboot_per_host.{{ inventory_hostname }}: true în
+          group_vars/all.yml (sau rulează manual "sudo reboot") pentru a finaliza actualizarea.
+      when: reboot_required_file.stat.exists and not (allow_reboot | bool)

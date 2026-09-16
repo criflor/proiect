@@ -1,0 +1,76 @@
+---
+# Configurează containerd (via k3s) pe toate nodurile clusterului ca să aibă
+# încredere în certificatul CA al registry-ului GitLab și să se autentifice
+# cu deploy token-ul (doar read_registry) la tragerea imaginii demo-app.
+- name: Configurare încredere/autentificare registry GitLab pe nodurile k3s
+  hosts: k3s_cluster
+  become: true
+
+  vars:
+    gitlab_ca_file: "{{ playbook_dir }}/../files/gitlab-kube-dev-local-ca.crt"
+    vault_registry_deploy_token_path: secret/data/gitlab/registry_deploy_token
+
+  tasks:
+    - name: Citește tokenul root Vault
+      ansible.builtin.slurp:
+        src: "{{ vault_init_file }}"
+      register: vault_root_read
+      delegate_to: localhost
+      become: false
+
+    - name: Citește deploy token-ul (username + token) din Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/{{ vault_registry_deploy_token_path }}"
+        validate_certs: false
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+      register: deploy_token_read
+      delegate_to: localhost
+      become: false
+      no_log: true
+
+    # containerd, la tragerea imaginilor, rezolvă numele de host folosind
+    # DNS-ul sistemului de operare al NODULUI, nu CoreDNS-ul din cluster
+    # (acela răspunde doar cererilor venite din poduri) - fără intrarea de
+    # mai jos, pull-ul eșuează cu "lookup gitlab.kube-dev.local: Try again".
+    - name: Adaugă gitlab.kube-dev.local în /etc/hosts pe nod
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        line: "10.10.10.20 gitlab.kube-dev.local"
+        regexp: "gitlab\\.kube-dev\\.local$"
+
+    - name: Asigură existența directorului /etc/rancher/k3s (nu există implicit pe agenți)
+      ansible.builtin.file:
+        path: /etc/rancher/k3s
+        state: directory
+        mode: "0755"
+
+    - name: Copiază certificatul CA al GitLab pe nod
+      ansible.builtin.copy:
+        src: "{{ gitlab_ca_file }}"
+        dest: /etc/rancher/k3s/gitlab-ca.crt
+        mode: "0644"
+      register: ca_copy
+
+    - name: Configurează registries.yaml (CA + autentificare)
+      ansible.builtin.copy:
+        content: |
+          configs:
+            "gitlab.kube-dev.local:5050":
+              auth:
+                username: "{{ deploy_token_read.json.data.data.username }}"
+                password: "{{ deploy_token_read.json.data.data.token }}"
+              tls:
+                ca_file: /etc/rancher/k3s/gitlab-ca.crt
+        dest: /etc/rancher/k3s/registries.yaml
+        mode: "0600"
+      register: registries_config
+      no_log: true
+
+    # Toate nodurile rulează serviciul "k3s" (server) - topologie HA
+    # simetrică, fără noduri de tip "agent" separate (§ vezi 01_install_k3s.yml).
+    - name: Repornește k3s ca să preia configurația de registry
+      ansible.builtin.systemd:
+        name: k3s
+        state: restarted
+      when: ca_copy.changed or registries_config.changed

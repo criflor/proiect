@@ -1,0 +1,36 @@
+# Aplicația Argo CD de PRODUCȚIE care urmărește proiectul GitLab separat de
+# manifeste (cerința 7) și le sincronizează automat în cluster (cerința 8).
+# Overlay-ul Kustomize "overlays/prod" e actualizat DOAR prin Merge Request
+# aprobat manual pe branch-ul "main" (vezi apps/demo_app/.gitlab-ci.yml).
+# Mediul de dev are propria Application - vezi argocd-application-dev.yaml.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: demo-app
+  namespace: argocd
+spec:
+  project: default
+
+  source:
+    repoURL: https://gitlab.kube-dev.local/appadm/demo-app-manifests.git
+    targetRevision: main
+    path: overlays/prod
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: demo-app
+
+  # Politica de sincronizare (documentată explicit, cerută de enunț):
+  #   - automated: orice modificare aprobată (push pe main) în repo-ul GitOps
+  #     se aplică automat în cluster, fără intervenție manuală;
+  #   - selfHeal: dacă cineva modifică manual o resursă direct în cluster
+  #     (drift), Argo CD o readuce la starea din Git la următoarea reconciliere;
+  #   - prune: dacă o resursă e ștearsă din Git, e ștearsă și din cluster -
+  #     starea reală urmează mereu exact starea din Git ("GitOps pur"),
+  #     conform deciziei confirmate în documentație.
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

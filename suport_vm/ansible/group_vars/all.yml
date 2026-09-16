@@ -1,0 +1,20 @@
+---
+adm_user: adm
+adm_ssh_public_key_path: "{{ playbook_dir }}/../../../ssh/id_ed25519.pub"
+
+# Tot ce rulează după create_admin_user.yml se conectează ca "adm" (cheie
+# SSH, sudo NOPASSWD), nu ca "admin" din inventar - aceeași abordare ca la
+# kubernetes_cluster/k3s/group_vars/all.yml. Excepția e chiar
+# create_admin_user.yml, care suprascrie explicit acest var la nivel de
+# play (adm nu există încă la acea rulare).
+ansible_user: adm
+
+allow_reboot_default: false
+
+allow_reboot_per_host:
+  suport-vm: false
+
+# Adresa Vault, singurul loc unde există secrete de-acum - reutilizată de
+# toate playbook-urile care generează/citesc parole și token-uri.
+vault_addr: "https://10.10.10.20:8200"
+vault_init_file: "{{ playbook_dir }}/../../.vault_init.json"

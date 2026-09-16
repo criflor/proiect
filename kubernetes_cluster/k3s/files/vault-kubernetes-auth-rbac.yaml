@@ -1,0 +1,21 @@
+# Identitatea pe care Vault o folosește ca să valideze (TokenReview) JWT-urile
+# prezentate de alte ServiceAccount-uri (ex. cert-manager) - "system:auth-delegator"
+# e rolul minim standard pentru exact acest scop, nu acces general la cluster.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vault-auth
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: vault-auth-token-reviewer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: vault-auth
+    namespace: kube-system

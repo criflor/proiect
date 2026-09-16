@@ -1,0 +1,11 @@
+# Kubeconfig-ul e scris implicit în ~/.kube/, în afara repo-ului. Regula de mai
+# jos e doar o plasă de siguranță, în caz că local_kubeconfig_path e schimbat
+# să pointeze într-un loc din acest folder.
+*.kubeconfig
+kubeconfig*.yaml
+
+# Certificatul rădăcinii Vault (§13 din documentație) - regenerat automat de
+# configure_vault_pki.yml la fiecare instalare, nu e sursă scrisă de mână;
+# ar produce doar zgomot (un commit nou la fiecare rebuild, cu o rădăcină
+# CA diferită de fiecare dată).
+files/gitlab-kube-dev-local-ca.crt

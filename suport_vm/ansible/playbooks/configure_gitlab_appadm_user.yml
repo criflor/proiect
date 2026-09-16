@@ -1,0 +1,349 @@
+---
+# Creează userul GitLab "appadm" (din credențialele deja generate în Vault,
+# secret/users/appadm) și proiectele "demo-app" + "demo-app-manifests"
+# DIRECT sub el, nu sub root - rulează imediat după bootstrap_gitlab_api.yml.
+# Niciunul dintre proiecte nu se mai creează în bootstrap_gitlab_api.yml
+# (vezi comentariul de acolo) - sunt create AICI, idempotent (verificate
+# înainte, nu recreate la reaplicare).
+- name: Creare user GitLab "appadm" și proiecte demo-app/demo-app-manifests sub el
+  hosts: suport
+  become: true
+
+  vars:
+    vault_addr: "http://127.0.0.1:8201"
+    vault_appadm_user_path: secret/data/users/appadm
+    vault_appadm_token_path: secret/data/gitlab/appadm_token
+    vault_automation_token_path: secret/data/gitlab/automation_token
+    vault_registry_deploy_token_path: secret/data/gitlab/registry_deploy_token
+    vault_manifests_deploy_token_path: secret/data/gitlab/manifests_deploy_token
+
+  tasks:
+    # Apelul API de mai jos (deploy token) se face direct de pe acest host,
+    # către propriul lui hostname public - care nu e rezolvabil altfel aici
+    # (doar mașina de control și nodurile k3s au intrarea, din alte
+    # playbook-uri).
+    - name: Adaugă gitlab.kube-dev.local în /etc/hosts (rezolvare locală, pe acest host)
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        line: "127.0.0.1 gitlab.kube-dev.local"
+        regexp: "gitlab\\.kube-dev\\.local$"
+
+    - name: Citește tokenul root Vault
+      ansible.builtin.slurp:
+        src: "{{ vault_init_file }}"
+      register: vault_root_read
+      delegate_to: localhost
+      become: false
+
+    - name: Citește credențialele userului appadm din Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/{{ vault_appadm_user_path }}"
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+      register: appadm_read
+      no_log: true
+
+    - name: Verifică dacă userul GitLab "appadm" există deja
+      ansible.builtin.command:
+        cmd: gitlab-rails runner "puts User.find_by_username('appadm').present?"
+      register: appadm_gitlab_check
+      changed_when: false
+
+    # "User.new(...).save!" nu ajunge - din GitLab 17+ (arhitectura
+    # "Organizations"), un user nou are nevoie explicit de o organizație
+    # (namespace-ul personal e legat de ea) - eșuează cu "Namespace
+    # organization can't be blank" fără "organization_id" explicit. Folosim
+    # serviciul intern oficial (Users::CreateService), nu construcția
+    # manuală a modelului - verificat practic, vezi documentația.
+    - name: Creează userul GitLab "appadm" (o singură dată)
+      ansible.builtin.shell:
+        cmd: >
+          gitlab-rails runner "
+          admin = User.find_by_username('root');
+          result = ::Users::CreateService.new(admin, {
+            username: 'appadm',
+            name: 'appadm',
+            email: 'appadm@kube-dev.local',
+            password: '{{ appadm_read.json.data.data.password }}',
+            password_confirmation: '{{ appadm_read.json.data.data.password }}',
+            skip_confirmation: true,
+            organization_id: Organizations::Organization.default_organization.id
+          }).execute;
+          raise result.message unless result.success?
+          "
+      when: "'true' not in appadm_gitlab_check.stdout"
+      no_log: true
+
+    - name: Verifică dacă "appadm/demo-app" există deja
+      ansible.builtin.command:
+        cmd: gitlab-rails runner "puts Project.find_by_full_path('appadm/demo-app').present?"
+      register: appadm_project_check
+      changed_when: false
+
+    - name: Creează "demo-app" direct sub appadm (o singură dată)
+      ansible.builtin.shell:
+        cmd: >
+          gitlab-rails runner "
+          appadm = User.find_by_username('appadm');
+          result = ::Projects::CreateService.new(appadm, {
+            name: 'demo-app',
+            namespace_id: appadm.namespace.id,
+            visibility_level: Gitlab::VisibilityLevel::PRIVATE,
+            initialize_with_readme: false
+          }).execute;
+          raise result.errors.full_messages.join(', ') unless result.persisted?
+          "
+      when: "'true' not in appadm_project_check.stdout"
+      changed_when: true
+
+    - name: Verifică dacă "appadm/demo-app-manifests" există deja
+      ansible.builtin.command:
+        cmd: gitlab-rails runner "puts Project.find_by_full_path('appadm/demo-app-manifests').present?"
+      register: appadm_manifests_project_check
+      changed_when: false
+
+    - name: Creează "demo-app-manifests" direct sub appadm (o singură dată)
+      ansible.builtin.shell:
+        cmd: >
+          gitlab-rails runner "
+          appadm = User.find_by_username('appadm');
+          result = ::Projects::CreateService.new(appadm, {
+            name: 'demo-app-manifests',
+            namespace_id: appadm.namespace.id,
+            visibility_level: Gitlab::VisibilityLevel::PRIVATE,
+            initialize_with_readme: false
+          }).execute;
+          raise result.errors.full_messages.join(', ') unless result.persisted?
+          "
+      when: "'true' not in appadm_manifests_project_check.stdout"
+      changed_when: true
+
+    # Root e admin la nivel de instanță, dar asta NU îi dă automat drepturi
+    # de a face merge pe proiecte private ale altor useri (verificat
+    # practic: 401 Unauthorized la /merge, deși GET-urile de management
+    # funcționează normal cu același token) - fără o apartenență explicită,
+    # tokenul de automatizare nu poate acționa ca aprobator (cerința 8) prin
+    # API pe niciunul din proiectele lui appadm. Idempotent - GitLab nu
+    # duplică o apartenență deja existentă.
+    - name: Adaugă "root" ca Maintainer pe proiectele lui appadm (necesar pentru merge prin API)
+      ansible.builtin.shell:
+        cmd: >
+          gitlab-rails runner "
+          root = User.find_by_username('root');
+          ['appadm/demo-app', 'appadm/demo-app-manifests'].each do |path|
+            project = Project.find_by_full_path(path);
+            project.add_maintainer(root)
+          end
+          "
+      changed_when: false
+
+    - name: Verifică dacă tokenul de acces al lui "appadm" există deja în Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/{{ vault_appadm_token_path }}"
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        status_code: [200, 404]
+      register: appadm_token_check
+
+    # Scop minim - doar push în git, nu API/registry (spre deosebire de
+    # tokenul de automatizare al root-ului, care are nevoie de mai mult).
+    - name: Generează token-ul de acces personal pentru "appadm" (o singură dată)
+      ansible.builtin.shell:
+        cmd: >
+          gitlab-rails runner "
+          token = User.find_by_username('appadm').personal_access_tokens.create(
+            name: 'automation',
+            scopes: [:write_repository],
+            expires_at: 365.days.from_now
+          );
+          token.save!;
+          puts token.token
+          " | tail -1
+      register: appadm_token_gen
+      when: appadm_token_check.status == 404
+      no_log: true
+
+    - name: Scrie tokenul lui "appadm" în Vault (o singură dată)
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/{{ vault_appadm_token_path }}"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        body_format: json
+        body:
+          data:
+            value: "{{ appadm_token_gen.stdout }}"
+        status_code: 200
+      when: appadm_token_gen is not skipped
+      no_log: true
+
+    - name: Citește token-ul lui "appadm" din Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/{{ vault_appadm_token_path }}"
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+      register: appadm_token_read
+      no_log: true
+
+    # Tokenul de automatizare al root-ului (scope "api"), nu al lui appadm
+    # (doar "write_repository", insuficient pentru endpoint-ul de deploy
+    # tokens - verificat practic).
+    - name: Citește token-ul de automatizare din Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/{{ vault_automation_token_path }}"
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+      register: automation_token_read
+      no_log: true
+
+    - name: Verifică dacă deploy token-ul pentru registry există deja în Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/{{ vault_registry_deploy_token_path }}"
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        status_code: [200, 404]
+      register: registry_deploy_token_check
+
+    # Deploy Token cu domeniul minim necesar (doar citire din registry) -
+    # folosit ca imagePullSecret de manifestele Kubernetes, în loc de
+    # tokenul de automatizare/personal, cu permisiuni mult mai largi. Prin
+    # API-ul REST (nu ActiveRecord direct, ca mai sus) - "DeployToken" are
+    # constrângeri interne de bază de date nedocumentate ("scopes" nu e un
+    # atribut valid, "expires_at" trebuie dată, nu timestamp, plus o
+    # constrângere CHECK suplimentară la insert direct) - API-ul le rezolvă
+    # el însuși, verificat practic, vezi documentația.
+    - name: Creează deploy token-ul pentru citire din registry (o singură dată)
+      ansible.builtin.uri:
+        url: "https://gitlab.kube-dev.local/api/v4/projects/appadm%2Fdemo-app/deploy_tokens"
+        method: POST
+        headers:
+          PRIVATE-TOKEN: "{{ automation_token_read.json.data.data.value }}"
+        body_format: form-urlencoded
+        body:
+          name: k8s-registry-pull
+          scopes: ["read_registry"]
+        validate_certs: false
+        status_code: 201
+      register: registry_deploy_token_create
+      when: registry_deploy_token_check.status == 404
+      no_log: true
+
+    - name: Scrie deploy token-ul de registry în Vault (o singură dată)
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/{{ vault_registry_deploy_token_path }}"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        body_format: json
+        body:
+          data:
+            username: "{{ registry_deploy_token_create.json.username }}"
+            token: "{{ registry_deploy_token_create.json.token }}"
+        status_code: 200
+      when: registry_deploy_token_create is not skipped
+      no_log: true
+
+    - name: Verifică dacă deploy token-ul pentru citirea repo-ului de manifeste există deja în Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/{{ vault_manifests_deploy_token_path }}"
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        status_code: [200, 404]
+      register: manifests_deploy_token_check
+
+    # Deploy Token cu domeniu minim (doar citirea codului sursă) - folosit de
+    # Argo CD ca să urmărească repo-ul de manifeste (cerința 8), fără să aibă
+    # nevoie de tokenul de automatizare/personal, cu permisiuni mult mai largi.
+    - name: Creează deploy token-ul pentru citirea repo-ului de manifeste (o singură dată)
+      ansible.builtin.uri:
+        url: "https://gitlab.kube-dev.local/api/v4/projects/appadm%2Fdemo-app-manifests/deploy_tokens"
+        method: POST
+        headers:
+          PRIVATE-TOKEN: "{{ automation_token_read.json.data.data.value }}"
+        body_format: form-urlencoded
+        body:
+          name: argocd-repo-read
+          scopes: ["read_repository"]
+        validate_certs: false
+        status_code: 201
+      register: manifests_deploy_token_create
+      when: manifests_deploy_token_check.status == 404
+      no_log: true
+
+    - name: Scrie deploy token-ul repo-ului de manifeste în Vault (o singură dată)
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/{{ vault_manifests_deploy_token_path }}"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        body_format: json
+        body:
+          data:
+            username: "{{ manifests_deploy_token_create.json.username }}"
+            token: "{{ manifests_deploy_token_create.json.token }}"
+        status_code: 200
+      when: manifests_deploy_token_create is not skipped
+      no_log: true
+
+    # Variabile CI/CD pe proiectul "demo-app" - folosite de job-ul
+    # "update-manifests" din .gitlab-ci.yml (vezi apps/demo_app/.gitlab-ci.yml)
+    # ca să deschidă automat un Merge Request pe demo-app-manifests cu noul
+    # tag de imagine, imediat după fiecare build reușit (cerința 6+8,
+    # legătura CI -> GitOps). "masked: true" - nu apar în logurile job-ului;
+    # "protected: false" - rulează și pe branch-uri neprotejate (orice push
+    # declanșează pipeline-ul, nu doar cele pe main).
+    - name: Verifică dacă variabila CI "APPADM_TOKEN" există deja pe demo-app
+      ansible.builtin.uri:
+        url: "https://gitlab.kube-dev.local/api/v4/projects/appadm%2Fdemo-app/variables/APPADM_TOKEN"
+        headers:
+          PRIVATE-TOKEN: "{{ automation_token_read.json.data.data.value }}"
+        validate_certs: false
+        status_code: [200, 404]
+      register: ci_var_appadm_check
+
+    - name: Creează variabila CI "APPADM_TOKEN" pe demo-app (o singură dată)
+      ansible.builtin.uri:
+        url: "https://gitlab.kube-dev.local/api/v4/projects/appadm%2Fdemo-app/variables"
+        method: POST
+        headers:
+          PRIVATE-TOKEN: "{{ automation_token_read.json.data.data.value }}"
+        body_format: form-urlencoded
+        body:
+          key: APPADM_TOKEN
+          value: "{{ appadm_token_read.json.data.data.value }}"
+          masked: true
+          protected: false
+        validate_certs: false
+        status_code: 201
+      when: ci_var_appadm_check.status == 404
+      no_log: true
+
+    - name: Verifică dacă variabila CI "MANIFESTS_AUTOMATION_TOKEN" există deja pe demo-app
+      ansible.builtin.uri:
+        url: "https://gitlab.kube-dev.local/api/v4/projects/appadm%2Fdemo-app/variables/MANIFESTS_AUTOMATION_TOKEN"
+        headers:
+          PRIVATE-TOKEN: "{{ automation_token_read.json.data.data.value }}"
+        validate_certs: false
+        status_code: [200, 404]
+      register: ci_var_automation_check
+
+    # Scope "api" (nu al lui appadm) - necesar ca job-ul CI să poată deschide
+    # un Merge Request prin API (endpoint-urile de management de proiect
+    # cer "api", nu doar "write_repository" - verificat practic, vezi
+    # push_demo_app_manifests.yml).
+    - name: Creează variabila CI "MANIFESTS_AUTOMATION_TOKEN" pe demo-app (o singură dată)
+      ansible.builtin.uri:
+        url: "https://gitlab.kube-dev.local/api/v4/projects/appadm%2Fdemo-app/variables"
+        method: POST
+        headers:
+          PRIVATE-TOKEN: "{{ automation_token_read.json.data.data.value }}"
+        body_format: form-urlencoded
+        body:
+          key: MANIFESTS_AUTOMATION_TOKEN
+          value: "{{ automation_token_read.json.data.data.value }}"
+          masked: true
+          protected: false
+        validate_certs: false
+        status_code: 201
+      when: ci_var_automation_check.status == 404
+      no_log: true

@@ -1,0 +1,68 @@
+---
+# Instalează CRD-urile Gateway API și Cilium (CNI + kube-proxy replacement +
+# Gateway API + L2 Announcements), toate rulate de pe mașina de control,
+# folosind kubeconfig-ul preluat la pasul anterior. Fișierele YAML/values sunt
+# în ../files, referențiate aici, nu inline.
+- name: Instalare Cilium (CNI, Gateway API, expunere externă)
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+
+  vars:
+    kubeconfig: "{{ local_kubeconfig_path }}"
+    # IP-ul real al primului nod (toate nodurile rulează server/API, dar
+    # instalarea Helm are nevoie de o singură adresă fixă) - fiecare
+    # nod are propriul apiserver local, dar Cilium se instalează o singură
+    # dată, centralizat, cu acest punct de intrare.
+    k3s_server_ip: "{{ hostvars[groups['k3s_server'][0]].ansible_host }}"
+
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+
+  tasks:
+    - name: Instalează CRD-urile Gateway API {{ gateway_api_version }}
+      ansible.builtin.command:
+        cmd: "kubectl apply -f {{ playbook_dir }}/../files/gateway-api-crds.yaml"
+      register: gwapi_apply
+      changed_when: "'unchanged' not in gwapi_apply.stdout"
+
+    - name: Adaugă/actualizează repo-ul Helm al Cilium
+      ansible.builtin.command:
+        cmd: helm repo add cilium https://helm.cilium.io/
+      register: helm_repo_add
+      changed_when: "'has been added' in helm_repo_add.stdout"
+
+    - name: Instalează/actualizează Cilium via Helm ({{ cilium_version }})
+      ansible.builtin.command:
+        cmd: >
+          helm upgrade --install cilium cilium/cilium
+          --version {{ cilium_version }}
+          --namespace kube-system
+          --values {{ playbook_dir }}/../files/cilium-values.yaml
+          --set k8sServiceHost={{ k3s_server_ip }}
+          --set k8sServicePort=6443
+      register: cilium_helm
+      changed_when: "'has been upgraded' in cilium_helm.stdout or 'has been installed' in cilium_helm.stdout"
+
+    # Valori precum "encryption.enabled" ajung doar în ConfigMap-ul
+    # "cilium-config", nu în spec-ul DaemonSet-ului - kubelet NU repornește
+    # automat un pod la schimbarea unui ConfigMap montat (verificat practic -
+    # fără acest restart explicit, "helm upgrade" scrie configurația nouă,
+    # dar agenții deja porniți continuă să ruleze cu cea veche).
+    - name: Repornește DaemonSet-ul Cilium dacă s-a schimbat configurația (preia setări doar-din-ConfigMap)
+      ansible.builtin.command:
+        cmd: kubectl -n kube-system rollout restart daemonset/cilium
+      when: cilium_helm.changed
+      changed_when: true
+
+    - name: Așteaptă ca toate podurile Cilium să fie Ready
+      ansible.builtin.command:
+        cmd: kubectl -n kube-system rollout status daemonset/cilium --timeout=300s
+      changed_when: false
+
+    - name: Configurează pool-ul de IP-uri și anunțarea L2 pentru servicii LoadBalancer
+      ansible.builtin.command:
+        cmd: "kubectl apply -f {{ playbook_dir }}/../files/l2-announcement-policy.yaml"
+      register: l2_apply
+      changed_when: "'unchanged' not in l2_apply.stdout"

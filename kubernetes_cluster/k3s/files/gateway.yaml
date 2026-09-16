@@ -1,0 +1,40 @@
+# Punctul unic de intrare HTTPS pentru aplicațiile expuse din clusterul
+# kube-dev. GatewayClass-ul "cilium" e creat automat de Cilium când
+# gatewayAPI.enabled: true (vezi cilium-values.yaml) - nu mai trebuie definit
+# aici. IP-ul extern vine din pool-ul configurat în l2-announcement-policy.yaml.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gateway
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: kube-dev-gateway
+  namespace: gateway
+  annotations:
+    # cert-manager provizionează automat secretul TLS de mai jos,
+    # semnat de CA-ul intern al clusterului (vezi cluster-issuer.yaml).
+    cert-manager.io/cluster-issuer: kube-dev-ca-issuer
+spec:
+  gatewayClassName: cilium
+  listeners:
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: "*.kube-dev.local"
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: kube-dev-gateway-tls
+      allowedRoutes:
+        namespaces:
+          from: All
+    - name: http-redirect
+      protocol: HTTP
+      port: 80
+      hostname: "*.kube-dev.local"
+      allowedRoutes:
+        namespaces:
+          from: All

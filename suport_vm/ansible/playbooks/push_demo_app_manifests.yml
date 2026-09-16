@@ -1,0 +1,267 @@
+---
+# Publică manifestele Kubernetes (apps/demo_app/k8s/) în proiectul GitLab
+# separat "demo-app-manifests" (cerința 7) - același tipar ca la publicarea
+# surselor aplicației (push_demo_app_source.yml): director de lucru propriu,
+# nu direct în apps/demo_app/k8s (deja urmărit de repo-ul principal rasirom).
+#
+# NU mai scrie direct pe "main" (branch-ul e protejat explicit împotriva
+# push-ului direct - vezi documentatie.md, cerința 8) - publică pe un branch
+# separat și deschide un Merge Request. Argo CD urmărește doar "main", deci
+# schimbarea nu ajunge în cluster decât după ce cineva revizuiește și dă
+# merge manual MR-ului - acesta e pasul de "aprobare" cerut explicit de
+# enunț, imposibil de automatizat integral (GitLab CE nu are "Merge Request
+# Approvals" - verificat practic, e funcție Premium/Ultimate).
+- name: Publicare manifeste demo-app în GitLab (prin Merge Request)
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+
+  vars:
+    gitlab_hostname: gitlab.kube-dev.local
+    manifests_src: "{{ playbook_dir }}/../../../apps/demo_app/k8s"
+    git_workdir: "{{ playbook_dir }}/../../.demo_app_manifests_git"
+    vault_appadm_token_path: secret/data/gitlab/appadm_token
+    vault_automation_token_path: secret/data/gitlab/automation_token
+    gitlab_ca_file: "{{ playbook_dir }}/../../../kubernetes_cluster/k3s/files/gitlab-kube-dev-local-ca.crt"
+    project_path: appadm/demo-app-manifests
+    update_branch: manifests-update
+
+  tasks:
+    - name: Citește tokenul root Vault
+      ansible.builtin.slurp:
+        src: "{{ vault_init_file }}"
+      register: vault_root_read
+
+    # Tokenul lui "appadm" - DOAR pentru git push/fetch (scop minim,
+    # write_repository). Apelurile API de management ale proiectului
+    # (Merge Request, protected branches) au nevoie de scope "api" -
+    # folosesc tokenul de automatizare al root-ului mai jos, ca la deploy
+    # tokens (verificat practic: "write_repository" primește 403 Forbidden
+    # pe endpoint-uri de management, nu doar pe cele de git).
+    - name: Citește token-ul lui "appadm" din Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/{{ vault_appadm_token_path }}"
+        validate_certs: false
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+      register: appadm_token_read
+      no_log: true
+
+    - name: Citește token-ul de automatizare din Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/{{ vault_automation_token_path }}"
+        validate_certs: false
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+      register: automation_token_read
+      no_log: true
+
+    - name: Creează directorul de lucru pentru repo-ul de manifeste
+      ansible.builtin.file:
+        path: "{{ git_workdir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Verifică dacă directorul de lucru e deja un repo git
+      ansible.builtin.stat:
+        path: "{{ git_workdir }}/.git"
+      register: git_dir_check
+
+    - name: Inițializează repo-ul git (o singură dată)
+      ansible.builtin.command:
+        cmd: git init -b main
+        chdir: "{{ git_workdir }}"
+      when: not git_dir_check.stat.exists
+
+    - name: Configurează repo-ul să aibă încredere în CA-ul GitLab (doar acest repo)
+      ansible.builtin.command:
+        cmd: "git config http.sslCAInfo {{ gitlab_ca_file }}"
+        chdir: "{{ git_workdir }}"
+      changed_when: false
+
+    - name: Configurează identitatea git locală pentru commit-uri automate
+      ansible.builtin.command:
+        cmd: "git config --replace-all {{ item.key }} {{ item.value }}"
+        chdir: "{{ git_workdir }}"
+      loop:
+        - { key: "user.email", value: "appadm@kube-dev.local" }
+        - { key: "user.name", value: "appadm" }
+      changed_when: false
+
+    - name: Adaugă remote-ul "origin" (fără credențiale în configurație)
+      ansible.builtin.command:
+        cmd: "git remote add origin https://{{ gitlab_hostname }}/{{ project_path }}.git"
+        chdir: "{{ git_workdir }}"
+      register: remote_add
+      failed_when: false
+      changed_when: remote_add.rc == 0
+
+    - name: Actualizează remote-ul "origin", dacă exista deja
+      ansible.builtin.command:
+        cmd: "git remote set-url origin https://{{ gitlab_hostname }}/{{ project_path }}.git"
+        chdir: "{{ git_workdir }}"
+      when: remote_add.rc != 0
+      changed_when: false
+
+    # Pornim mereu de la ultima stare MERGEATĂ pe "main" (nu de la ultimul
+    # branch de lucru local, care poate conține deja un MR nemergeat încă) -
+    # evită să propunem din nou schimbări deja respinse/depășite.
+    - name: Aduce ultima stare a branch-ului "main" de pe GitLab
+      ansible.builtin.command:
+        cmd: >
+          git fetch
+          https://appadm:{{ appadm_token_read.json.data.data.value }}@{{ gitlab_hostname }}/{{ project_path }}.git
+          main
+        chdir: "{{ git_workdir }}"
+      register: fetch_main
+      failed_when: false
+      changed_when: true
+      no_log: true
+
+    - name: Creează/resetează branch-ul local de lucru la starea curentă de pe "main"
+      ansible.builtin.command:
+        cmd: git checkout -B {{ update_branch }} FETCH_HEAD
+        chdir: "{{ git_workdir }}"
+      when: fetch_main.rc == 0
+      changed_when: true
+
+    # Primul push vreodată (repo gol, "main" nu există încă pe GitLab) - fără
+    # o stare de pornit, branch-ul de lucru local (creat de "git init -b
+    # main" mai sus) devine el însuși "main".
+    - name: Creează branch-ul de lucru local (repo gol, primul push)
+      ansible.builtin.command:
+        cmd: git checkout -b {{ update_branch }}
+        chdir: "{{ git_workdir }}"
+      when: fetch_main.rc != 0
+      failed_when: false
+      changed_when: true
+
+    - name: Sincronizează manifestele în directorul de lucru
+      ansible.builtin.command:
+        cmd: "rsync -a --delete --exclude=.git {{ manifests_src }}/ {{ git_workdir }}/"
+      changed_when: true
+
+    - name: Adaugă toate fișierele în staging
+      ansible.builtin.command:
+        cmd: git add -A
+        chdir: "{{ git_workdir }}"
+      changed_when: true
+
+    - name: Verifică dacă există modificări de comis
+      ansible.builtin.command:
+        cmd: git diff --cached --quiet
+        chdir: "{{ git_workdir }}"
+      register: git_diff_check
+      failed_when: false
+      changed_when: false
+
+    - name: Creează commit-ul cu manifestele actualizate
+      ansible.builtin.command:
+        cmd: git commit -m "Actualizare manifeste demo-app"
+        chdir: "{{ git_workdir }}"
+      when: git_diff_check.rc != 0
+
+    # Branch-ul de lucru se resetează de fiecare dată la "main" + noile
+    # modificări (vezi checkout -B de mai sus) - istoricul lui nu contează,
+    # doar starea finală propusă în Merge Request, de aceea push forțat.
+    #
+    # Excepție: la primul push vreodată (repo gol, "main" nu există încă),
+    # GitLab nu acceptă un Merge Request către un branch inexistent - se
+    # publică direct pe "main" (nu există nimic de "aprobat" într-un repo
+    # gol, e doar popularea lui inițială).
+    - name: Publică (push) branch-ul de lucru în GitLab
+      ansible.builtin.command:
+        cmd: >
+          git push --force
+          https://appadm:{{ appadm_token_read.json.data.data.value }}@{{ gitlab_hostname }}/{{ project_path }}.git
+          HEAD:{{ 'main' if fetch_main.rc != 0 else update_branch }}
+        chdir: "{{ git_workdir }}"
+      when: git_diff_check.rc != 0 or fetch_main.rc != 0
+      changed_when: true
+      register: manifests_push
+      no_log: true
+
+    - name: Verifică dacă există deja un Merge Request deschis pentru acest branch
+      ansible.builtin.uri:
+        url: "https://{{ gitlab_hostname }}/api/v4/projects/{{ project_path | replace('/', '%2F') }}/merge_requests?source_branch={{ update_branch }}&state=opened"
+        headers:
+          PRIVATE-TOKEN: "{{ automation_token_read.json.data.data.value }}"
+        validate_certs: false
+        return_content: true
+      register: existing_mr_check
+      when: manifests_push is not skipped and fetch_main.rc == 0
+      no_log: true
+
+    # Fără merge automat aici - MR-ul rămâne deschis până cineva îl
+    # revizuiește și dă merge manual în UI/CLI GitLab. Abia atunci schimbarea
+    # ajunge pe "main", iar Argo CD (care urmărește doar acel branch) o preia
+    # și o sincronizează automat (cerința 8).
+    - name: Deschide Merge Request-ul către "main" (dacă nu există deja unul)
+      ansible.builtin.uri:
+        url: "https://{{ gitlab_hostname }}/api/v4/projects/{{ project_path | replace('/', '%2F') }}/merge_requests"
+        method: POST
+        headers:
+          PRIVATE-TOKEN: "{{ automation_token_read.json.data.data.value }}"
+        body_format: form-urlencoded
+        body:
+          source_branch: "{{ update_branch }}"
+          target_branch: main
+          title: "Actualizare manifeste demo-app"
+          remove_source_branch: false
+        validate_certs: false
+        status_code: 201
+      when: manifests_push is not skipped and fetch_main.rc == 0 and existing_mr_check.json | length == 0
+      no_log: true
+
+    - name: Verifică dacă branch-ul "main" e deja protejat
+      ansible.builtin.uri:
+        url: "https://{{ gitlab_hostname }}/api/v4/projects/{{ project_path | replace('/', '%2F') }}/protected_branches/main"
+        headers:
+          PRIVATE-TOKEN: "{{ automation_token_read.json.data.data.value }}"
+        validate_certs: false
+        status_code: [200, 404]
+      register: protected_branch_check
+
+    # GitLab creează automat, la crearea oricărui proiect nou, o regulă de
+    # protecție implicită pe branch-ul default cu push_access_level
+    # "Maintainers" (40) - nu "No one" (0). Owner-ul proiectului (appadm, pe
+    # propriul lui proiect) e Maintainer implicit, deci ar putea da push
+    # direct pe "main", ocolind complet Merge Request-ul - exact opusul
+    # cerinței 8. De-aia verificarea de mai jos nu se uită doar dacă REGULA
+    # există, ci dacă are valoarea corectă - altfel o șterge și o recreează.
+    - name: Șterge regula de protecție implicită (dacă nu are deja "No one" pe push)
+      ansible.builtin.uri:
+        url: "https://{{ gitlab_hostname }}/api/v4/projects/{{ project_path | replace('/', '%2F') }}/protected_branches/main"
+        method: DELETE
+        headers:
+          PRIVATE-TOKEN: "{{ automation_token_read.json.data.data.value }}"
+        validate_certs: false
+        status_code: 204
+      when: >
+        protected_branch_check.status == 200 and
+        protected_branch_check.json.push_access_levels | selectattr('access_level', 'equalto', 0) | list | length == 0
+
+    # Blochează push-ul direct pe "main" pentru oricine (inclusiv
+    # Maintainer) - singura cale de a modifica manifestele rămâne un Merge
+    # Request (cerința 8, "modificări aprobate" - vezi documentatie.md,
+    # §8.4). Aplicat DOAR aici, nu la crearea proiectului (bootstrap_gitlab_api.yml)
+    # - la primul push vreodată (mai sus, "main" nu exista încă), populăm
+    # întâi conținutul inițial pe "main", altfel chiar acel prim push ar fi
+    # respins de propria noastră regulă de protecție.
+    - name: Protejează branch-ul "main" împotriva push-ului direct
+      ansible.builtin.uri:
+        url: "https://{{ gitlab_hostname }}/api/v4/projects/{{ project_path | replace('/', '%2F') }}/protected_branches"
+        method: POST
+        headers:
+          PRIVATE-TOKEN: "{{ automation_token_read.json.data.data.value }}"
+        body_format: form-urlencoded
+        body:
+          name: main
+          push_access_level: 0
+          merge_access_level: 40
+        validate_certs: false
+        status_code: 201
+      when: >
+        protected_branch_check.status == 404 or
+        protected_branch_check.json.push_access_levels | selectattr('access_level', 'equalto', 0) | list | length == 0

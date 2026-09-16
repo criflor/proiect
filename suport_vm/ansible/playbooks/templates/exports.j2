@@ -1,0 +1,5 @@
+{# Generat de install_nfs_server.yml - nu edita manual. #}
+{# Acces restricționat explicit, per IP, doar la nodurile clusterului k3s. #}
+{% for client in nfs_allowed_clients %}
+{{ nfs_export_path }} {{ client }}(rw,sync,no_subtree_check,no_root_squash)
+{% endfor %}

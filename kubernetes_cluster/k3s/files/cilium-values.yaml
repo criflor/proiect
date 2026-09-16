@@ -1,0 +1,56 @@
+# Valori Helm pentru Cilium, referențiate din playbooks/05_install_cilium.yml
+# (nu inline în playbook, conform structurii cerute).
+
+# k3s nu instalează kube-proxy (--disable-kube-proxy) - Cilium îl înlocuiește
+# complet prin eBPF.
+kubeProxyReplacement: true
+
+# Cilium are nevoie explicit de adresa API server-ului când kube-proxy e
+# dezactivat (nu mai poate afla ClusterIP-ul serviciului kubernetes prin
+# kube-proxy). Deși în topologia HA actuală fiecare nod are propriul
+# apiserver local (toate rulează server, nu doar unul), instalarea Helm
+# are nevoie de o singură adresă fixă la momentul instalării - IP-ul real
+# al primului nod se transmite dinamic, via --set (vezi
+# playbooks/03_install_cilium.yml), NU aici.
+
+# IPAM: se bazează pe podCIDR alocat per-nod de k3s (--cluster-cidr=10.100.0.0/16),
+# fără o a doua sursă de adevăr pentru alocarea de adrese.
+ipam:
+  mode: kubernetes
+
+# Overlay VXLAN: funcționează indiferent de topologia L2/L3 de dedesubt,
+# cea mai robustă alegere implicită pentru un cluster mic, pe un singur subnet.
+routingMode: tunnel
+tunnelProtocol: vxlan
+
+# Expunere externă: Cilium ca Gateway API implementation + L2 Announcements
+# pentru IP-uri de tip LoadBalancer (vezi documentația soluției alese).
+gatewayAPI:
+  enabled: true
+
+l2announcements:
+  enabled: true
+
+# Necesar pentru L2 announcements (Cilium trebuie să știe ce noduri pot răspunde la ARP).
+k8sClientRateLimit:
+  qps: 10
+  burst: 20
+
+hubble:
+  enabled: true
+  relay:
+    enabled: true
+  ui:
+    enabled: true
+
+# Criptare transparentă pod-to-pod (WireGuard) - confidențialitate +
+# integritate pe traficul intern al clusterului (Kafka, Postgres, colectoare
+# etc., care azi circulă în clar, izolate doar prin CiliumNetworkPolicy, nu
+# criptate). Cheile sunt generate și rotite automat de Cilium, per nod - fără
+# nicio dependență de Vault/PKI la acest nivel. NU oferă autentificare de
+# identitate (asta ar fi mTLS, o schimbare mult mai mare, neactivată aici) -
+# doar face traficul deja permis ilizibil pentru un terț care ar asculta
+# rețeaua dintre noduri.
+encryption:
+  enabled: true
+  type: wireguard

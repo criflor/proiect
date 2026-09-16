@@ -1,0 +1,8 @@
+# Singurul secret local permis - rădăcina de încredere care desigilează
+# Vault-ul (vezi ansible/playbooks/install_vault.yml). Orice altă parolă/
+# token e generat, scris și citit direct din Vault (KV v2, cale "secret/"),
+# fără niciun alt fișier local intermediar.
+.vault_init.json
+
+.demo_app_git/
+.demo_app_manifests_git/

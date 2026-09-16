@@ -1,0 +1,52 @@
+---
+# Instalează cert-manager și CA-ul intern al clusterului (fișier separat,
+# referențiat mai jos), pentru certificate HTTPS pe serviciile expuse.
+- name: Instalare cert-manager + CA internă
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+
+  vars:
+    kubeconfig: "{{ local_kubeconfig_path }}"
+
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+
+  tasks:
+    - name: Adaugă/actualizează repo-ul Helm al cert-manager
+      ansible.builtin.command:
+        cmd: helm repo add jetstack https://charts.jetstack.io
+      register: helm_repo_add
+      changed_when: "'has been added' in helm_repo_add.stdout"
+
+    - name: Instalează/actualizează cert-manager via Helm ({{ cert_manager_version }})
+      ansible.builtin.command:
+        cmd: >
+          helm upgrade --install cert-manager jetstack/cert-manager
+          --version {{ cert_manager_version }}
+          --namespace cert-manager
+          --create-namespace
+          --set crds.enabled=true
+          --set config.enableGatewayAPI=true
+      register: cm_helm
+      changed_when: "'has been upgraded' in cm_helm.stdout or 'has been installed' in cm_helm.stdout"
+
+    - name: Așteaptă ca cert-manager (inclusiv webhook) să fie disponibil
+      ansible.builtin.command:
+        cmd: "kubectl -n cert-manager rollout status deployment/{{ item }} --timeout=180s"
+      loop:
+        - cert-manager
+        - cert-manager-webhook
+        - cert-manager-cainjector
+      changed_when: false
+
+    # Aplicat aici doar ca să existe resursa - Issuer-ul Vault nu poate emite
+    # încă certificate (autentificarea Kubernetes-Vault nu e configurată
+    # până la 16_configure_vault_pki_auth.yml, care îl reaplică). cert-manager
+    # reîncearcă automat, fără nicio intervenție manuală.
+    - name: Configurează ClusterIssuer-ul clusterului (Vault PKI)
+      ansible.builtin.command:
+        cmd: "kubectl apply -f {{ playbook_dir }}/../files/cluster-issuer.yaml"
+      register: issuer_apply
+      changed_when: "'unchanged' not in issuer_apply.stdout"

@@ -1,0 +1,29 @@
+# Generat de install_gitlab.yml - nu edita manual, modifică playbook-ul.
+
+external_url 'https://{{ gitlab_hostname }}'
+
+# Registry de containere privat, integrat în GitLab - satisface cerința unui
+# registry privat fără o componentă separată (ex. Harbor).
+registry_external_url 'https://{{ gitlab_hostname }}:{{ gitlab_registry_port }}'
+
+nginx['ssl_certificate'] = "{{ ssl_dir }}/{{ gitlab_hostname }}.crt"
+nginx['ssl_certificate_key'] = "{{ ssl_dir }}/{{ gitlab_hostname }}.key"
+registry_nginx['ssl_certificate'] = "{{ ssl_dir }}/{{ gitlab_hostname }}.crt"
+registry_nginx['ssl_certificate_key'] = "{{ ssl_dir }}/{{ gitlab_hostname }}.key"
+
+# Componente de monitorizare interne dezactivate - SigNoz (vezi cerința 10)
+# preia rolul de monitorizare pentru tot mediul, nu are sens dublarea lui
+# Prometheus/Alertmanager doar pentru GitLab, mai ales pe un VM cu resurse
+# partajate cu NFS și SigNoz. (Grafana embedded a fost eliminat din Omnibus
+# în versiunile recente de GitLab, nu mai există opțiunea grafana['enable'].)
+prometheus_monitoring['enable'] = false
+alertmanager['enable'] = false
+
+# Amprentă redusă - instanță single-user, fără nevoie de concurență mare.
+puma['worker_processes'] = 2
+sidekiq['max_concurrency'] = 10
+{% if is_first_install %}
+
+# Parolă de root - are efect DOAR la prima populare a bazei de date interne.
+gitlab_rails['initial_root_password'] = '{{ initial_root_password }}'
+{% endif %}

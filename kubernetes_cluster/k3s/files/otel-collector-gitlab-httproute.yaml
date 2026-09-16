@@ -1,0 +1,21 @@
+# Expune endpoint-ul webhook GitLab al colectorului OTel prin Gateway-ul
+# comun (HTTPS, terminat acolo) - GitLab (pe VM-ul de suport, în afara
+# clusterului) trimite evenimentele de pipeline aici. Validarea payload-ului
+# se face prin token secret (webhook.secret în configul colectorului), nu
+# doar prin obscuritatea URL-ului.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: otel-collector-gitlab-webhook
+  namespace: monitoring
+spec:
+  parentRefs:
+    - name: kube-dev-gateway
+      namespace: gateway
+      sectionName: https
+  hostnames:
+    - "ci-events.kube-dev.local"
+  rules:
+    - backendRefs:
+        - name: otel-collector
+          port: 8081

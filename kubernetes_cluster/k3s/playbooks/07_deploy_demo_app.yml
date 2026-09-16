@@ -1,0 +1,106 @@
+---
+# Populează în Vault secretele runtime ale aplicației demo (credențiale
+# Postgres, cheia de sesiune Flask) - NU le mai creează ca Secret-uri
+# Kubernetes direct (acela era motivul inițial pentru care acest playbook nu
+# putea fi înlocuit complet de GitOps: ar fi însemnat să comităm parole în
+# git). Acum consumatorul e External Secrets Operator (§17_install_external_secrets.yml),
+# care le citește din Vault și le materializează ca Secret-uri native,
+# printr-un manifest `ExternalSecret` obișnuit, comitat în
+# apps/demo_app/k8s/base/ - fără nimic sensibil în git, dar și fără niciun
+# pas manual de generare/creare secrete.
+#
+# Rulează pentru ambele medii (producție + dev) - fiecare cu propriile
+# credențiale, sub propriul prefix Vault (§ recomandare "Postgres dedicat
+# pentru dev, nu partajat cu prod").
+- name: Populare secrete runtime Vault pentru aplicația demo
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+
+  vars:
+    demo_app_environments:
+      - prod
+      - dev
+
+  tasks:
+    - name: Citește tokenul root Vault
+      ansible.builtin.slurp:
+        src: "{{ vault_init_file }}"
+      register: vault_root_read
+
+    - name: Verifică dacă secretele Postgres există deja în Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/secret/data/demo-app/{{ item }}/postgres"
+        validate_certs: false
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        status_code: [200, 404]
+      register: pg_secret_check
+      loop: "{{ demo_app_environments }}"
+
+    - name: Generează parola Postgres (doar dacă lipsește din Vault)
+      ansible.builtin.command:
+        cmd: openssl rand -base64 24
+      register: pg_password_gen
+      loop: "{{ pg_secret_check.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: item.status == 404
+
+    - name: Scrie credențialele Postgres în Vault (o singură dată per mediu)
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/secret/data/demo-app/{{ item.item.item }}/postgres"
+        validate_certs: false
+        method: POST
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        body_format: json
+        body:
+          data:
+            POSTGRES_USER: demo_app
+            POSTGRES_DB: demo_app
+            POSTGRES_PASSWORD: "{{ item.stdout }}"
+        status_code: 200
+      loop: "{{ pg_password_gen.results }}"
+      loop_control:
+        label: "{{ item.item.item }}"
+      when: item is not skipped
+      no_log: true
+
+    - name: Verifică dacă cheia de sesiune Flask există deja în Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/secret/data/demo-app/{{ item }}/flask"
+        validate_certs: false
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        status_code: [200, 404]
+      register: flask_secret_check
+      loop: "{{ demo_app_environments }}"
+
+    - name: Generează cheia de sesiune Flask (doar dacă lipsește din Vault)
+      ansible.builtin.command:
+        cmd: openssl rand -base64 32
+      register: flask_key_gen
+      loop: "{{ flask_secret_check.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: item.status == 404
+
+    - name: Scrie cheia de sesiune Flask în Vault (o singură dată per mediu)
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/secret/data/demo-app/{{ item.item.item }}/flask"
+        validate_certs: false
+        method: POST
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        body_format: json
+        body:
+          data:
+            FLASK_SECRET_KEY: "{{ item.stdout }}"
+        status_code: 200
+      loop: "{{ flask_key_gen.results }}"
+      loop_control:
+        label: "{{ item.item.item }}"
+      when: item is not skipped
+      no_log: true

@@ -1,0 +1,128 @@
+---
+# Activează autentificarea OIDC (Keycloak) în Vault - metodă ALTERNATIVĂ,
+# adăugată alături de cele existente (tokenul root, userpass "appadm" - vezi
+# suport_vm/ansible/playbooks/configure_vault_admin_user.yml), fără să le
+# dezactiveze. "ssoadm" (creat de 19_configure_sso_keycloak.yml) primește,
+# prin SSO, exact policy-ul "admin" deja folosit de "appadm" - drepturi
+# echivalente root, nu o policy nouă/separată.
+#
+# Vault rulează pe "suport-vm", în afara clusterului - are nevoie de propria
+# rezolvare pentru keycloak.kube-dev.local ca să verifice discovery URL-ul
+# OIDC (nimic altceva de pe suport-vm nu avea nevoie de asta până acum).
+# "suport-vm" nu face parte din inventarul acestui arbore Ansible
+# (kubernetes_cluster/k3s/) - un SSH direct, izolat, e mai simplu decât să
+# se împrumute inventarul altui proiect doar pentru un singur task.
+- name: Configurare autentificare OIDC (Keycloak) în Vault
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+
+  vars:
+    keycloak_hostname: keycloak.kube-dev.local
+    sso_realm: kube-dev
+    sso_user: ssoadm
+    vault_oidc_role: ssoadm
+    vault_oidc_client_path: secret/data/keycloak/vault_oidc_client
+    suport_vm_host: 10.10.10.20
+    suport_vm_ssh_key: "{{ playbook_dir }}/../../../ssh/id_ed25519"
+    root_ca_file: "{{ playbook_dir }}/../files/gitlab-kube-dev-local-ca.crt"
+    vault_hostname_addr: "https://vault.kube-dev.local:8200"
+
+  tasks:
+    - name: Adaugă keycloak.kube-dev.local în /etc/hosts pe suport-vm (necesar pentru Vault OIDC discovery)
+      ansible.builtin.command:
+        cmd: >
+          ssh -i {{ suport_vm_ssh_key }} -o StrictHostKeyChecking=accept-new adm@{{ suport_vm_host }}
+          "grep -q 'keycloak\.kube-dev\.local$' /etc/hosts ||
+          echo '10.10.10.192 keycloak.kube-dev.local' | sudo tee -a /etc/hosts"
+      register: suport_hosts_update
+      changed_when: "'keycloak.kube-dev.local' in suport_hosts_update.stdout"
+
+    - name: Citește tokenul root Vault
+      ansible.builtin.slurp:
+        src: "{{ vault_init_file }}"
+      register: vault_root_read
+
+    - name: Citește credențialele clientului OIDC "vault" din Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/{{ vault_oidc_client_path }}"
+        validate_certs: false
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+      register: vault_oidc_client_read
+      no_log: true
+
+    - name: Verifică ce metode de autentificare sunt deja activate
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/sys/auth"
+        validate_certs: false
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        return_content: true
+      register: vault_auth_list
+
+    - name: Activează metoda de autentificare OIDC
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/sys/auth/oidc"
+        validate_certs: false
+        method: POST
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        body_format: json
+        body:
+          type: oidc
+        status_code: [200, 204]
+      when: "'oidc/' not in vault_auth_list.json"
+
+    # "oidc_discovery_url" e chiar Keycloak-ul din cluster, cu certificat
+    # semnat de aceeași rădăcină PKI pe care Vault însuși o găzduiește (§13) -
+    # dar clientul HTTP intern al Vault-ului (spre deosebire de apelurile
+    # Ansible de mai sus, unde folosim "validate_certs: false") verifică
+    # strict cu magazinul de încredere de sistem, unde rădăcina noastră NU e
+    # instalată - eșuează cu "error checking oidc discovery URL" fără
+    # "oidc_discovery_ca_pem" explicit (verificat practic).
+    - name: Configurează metoda OIDC (idempotent, necondiționat)
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/auth/oidc/config"
+        validate_certs: false
+        method: POST
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        body_format: json
+        body:
+          oidc_discovery_url: "https://{{ keycloak_hostname }}/realms/{{ sso_realm }}"
+          oidc_discovery_ca_pem: "{{ lookup('file', root_ca_file) }}"
+          oidc_client_id: "{{ vault_oidc_client_read.json.data.data.client_id }}"
+          oidc_client_secret: "{{ vault_oidc_client_read.json.data.data.client_secret }}"
+          default_role: "{{ vault_oidc_role }}"
+        status_code: [200, 204]
+      no_log: true
+
+    # Legat STRICT de identitatea "ssoadm" (claim "preferred_username") - nu
+    # de întregul grup/realm, ca să nu extindem accidental drepturi de admin
+    # la orice cont Keycloak viitor.
+    - name: Creează/actualizează rolul OIDC "{{ vault_oidc_role }}" (policy "admin", echivalent root)
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/auth/oidc/role/{{ vault_oidc_role }}"
+        validate_certs: false
+        method: POST
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        body_format: json
+        body:
+          user_claim: preferred_username
+          bound_claims:
+            preferred_username: "{{ sso_user }}"
+          # Vault UI construiește "redirect_uri" din URL-ul curent al
+          # browser-ului - trebuie permise ambele adrese prin care Vault
+          # poate fi accesat (IP direct și hostname), altfel autentificarea
+          # eșuează cu "Missing auth_url" pentru oricine intră pe adresa
+          # neinclusă aici (verificat practic).
+          allowed_redirect_uris:
+            - "{{ vault_addr }}/ui/vault/auth/oidc/oidc/callback"
+            - "{{ vault_hostname_addr }}/ui/vault/auth/oidc/oidc/callback"
+            - "http://localhost:8250/oidc/callback"
+          policies: admin
+          ttl: 1h
+        status_code: [200, 204]

@@ -1,0 +1,137 @@
+---
+# Publică sursele aplicației demo (fără directorul k8s/, care are propriul
+# proiect GitLab - cerința 7) în proiectul "demo-app" din GitLab.
+#
+# Rulează dintr-un director de lucru separat (suport_vm/.demo_app_git),
+# NU direct din apps/demo_app - acel folder e deja urmărit de repo-ul git
+# principal al acestui proiect (rasirom); un al doilea .git imbricat acolo
+# ar crea o situație confuză de tip "submodul neintenționat".
+- name: Publicare surse demo-app în GitLab
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+
+  vars:
+    gitlab_hostname: gitlab.kube-dev.local
+    demo_app_src: "{{ playbook_dir }}/../../../apps/demo_app"
+    git_workdir: "{{ playbook_dir }}/../../.demo_app_git"
+    vault_appadm_token_path: secret/data/gitlab/appadm_token
+    project_path: appadm/demo-app
+    # Reutilizează certificatul CA deja generat pentru GitLab (vezi
+    # kubernetes_cluster/k3s/files/gitlab-kube-dev-local-ca.crt) - fără el,
+    # git ar respinge conexiunea (certificat self-signed, necunoscut sistemului).
+    gitlab_ca_file: "{{ playbook_dir }}/../../../kubernetes_cluster/k3s/files/gitlab-kube-dev-local-ca.crt"
+
+  tasks:
+    - name: Citește tokenul root Vault
+      ansible.builtin.slurp:
+        src: "{{ vault_init_file }}"
+      register: vault_root_read
+
+    # Push-ul se face ca userul "appadm" (creat de configure_gitlab_appadm_user.yml,
+    # Maintainer pe proiectul demo-app), nu ca root - scop minim (doar
+    # write_repository), nu tokenul de automatizare cu drepturi mult mai largi.
+    - name: Citește token-ul lui "appadm" din Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/{{ vault_appadm_token_path }}"
+        validate_certs: false
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+      register: appadm_token_read
+      no_log: true
+
+    - name: Creează directorul de lucru pentru repo-ul demo-app
+      ansible.builtin.file:
+        path: "{{ git_workdir }}"
+        state: directory
+        mode: "0755"
+
+    # Oglindește sursele aplicației, fără k8s/ (proiect GitLab separat) și
+    # fără .git (nu suprascriem istoricul git al directorului de lucru).
+    - name: Sincronizează sursele aplicației în directorul de lucru
+      ansible.builtin.command:
+        cmd: >
+          rsync -a --delete
+          --exclude=.git
+          --exclude=k8s
+          {{ demo_app_src }}/ {{ git_workdir }}/
+      changed_when: true
+
+    - name: Verifică dacă directorul de lucru e deja un repo git
+      ansible.builtin.stat:
+        path: "{{ git_workdir }}/.git"
+      register: git_dir_check
+
+    - name: Inițializează repo-ul git (o singură dată)
+      ansible.builtin.command:
+        cmd: git init -b main
+        chdir: "{{ git_workdir }}"
+      when: not git_dir_check.stat.exists
+
+    - name: Configurează repo-ul să aibă încredere în CA-ul GitLab (doar acest repo, nu tot sistemul)
+      ansible.builtin.command:
+        cmd: "git config http.sslCAInfo {{ gitlab_ca_file }}"
+        chdir: "{{ git_workdir }}"
+      changed_when: false
+
+    # "--replace-all" - robust indiferent de starea anterioară a
+    # repo-ului de lucru (poate avea deja o valoare, de la un run anterior
+    # cu altă identitate - "git config" simplu eșuează cu "multiple values"
+    # dacă ajunge vreodată să existe mai mult de o intrare).
+    - name: Configurează identitatea git locală pentru commit-uri automate
+      ansible.builtin.command:
+        cmd: "git config --replace-all {{ item.key }} {{ item.value }}"
+        chdir: "{{ git_workdir }}"
+      loop:
+        - { key: "user.email", value: "appadm@kube-dev.local" }
+        - { key: "user.name", value: "appadm" }
+      changed_when: false
+
+    - name: Adaugă remote-ul "origin" (fără credențiale în configurație)
+      ansible.builtin.command:
+        cmd: "git remote add origin https://{{ gitlab_hostname }}/{{ project_path }}.git"
+        chdir: "{{ git_workdir }}"
+      register: remote_add
+      failed_when: false
+      changed_when: remote_add.rc == 0
+
+    - name: Actualizează remote-ul "origin", dacă exista deja
+      ansible.builtin.command:
+        cmd: "git remote set-url origin https://{{ gitlab_hostname }}/{{ project_path }}.git"
+        chdir: "{{ git_workdir }}"
+      when: remote_add.rc != 0
+      changed_when: false
+
+    - name: Adaugă toate fișierele în staging
+      ansible.builtin.command:
+        cmd: git add -A
+        chdir: "{{ git_workdir }}"
+      changed_when: true
+
+    - name: Verifică dacă există modificări de comis
+      ansible.builtin.command:
+        cmd: git diff --cached --quiet
+        chdir: "{{ git_workdir }}"
+      register: git_diff_check
+      failed_when: false
+      changed_when: false
+
+    - name: Creează commit-ul cu sursele actualizate
+      ansible.builtin.command:
+        cmd: >
+          git commit -m "Actualizare surse demo-app (sincronizat din monorepo)"
+        chdir: "{{ git_workdir }}"
+      when: git_diff_check.rc != 0
+
+    # Token-ul e folosit direct în comanda de push (nu salvat în
+    # .git/config), ca să nu rămână persistent în text clar pe disc.
+    - name: Publică (push) în proiectul demo-app din GitLab (ca appadm)
+      ansible.builtin.command:
+        cmd: >
+          git push
+          https://appadm:{{ appadm_token_read.json.data.data.value }}@{{ gitlab_hostname }}/{{ project_path }}.git
+          HEAD:main
+        chdir: "{{ git_workdir }}"
+      changed_when: true
+      no_log: true

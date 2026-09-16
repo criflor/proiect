@@ -1,0 +1,41 @@
+---
+# Configurează Gateway-ul HTTPS (punctul de intrare pentru aplicații),
+# folosind GatewayClass-ul "cilium" creat automat de Cilium și certificatul
+# emis automat de cert-manager via adnotarea de pe Gateway.
+- name: Configurare Gateway HTTPS pentru expunerea aplicațiilor
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+
+  vars:
+    kubeconfig: "{{ local_kubeconfig_path }}"
+
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+
+  tasks:
+    - name: Aplică Gateway-ul kube-dev-gateway
+      ansible.builtin.command:
+        cmd: "kubectl apply -f {{ playbook_dir }}/../files/gateway.yaml"
+      register: gw_apply
+      changed_when: "'unchanged' not in gw_apply.stdout"
+
+    - name: Așteaptă alocarea adresei IP externe pentru Gateway
+      ansible.builtin.command:
+        cmd: >
+          kubectl -n gateway wait gateway/kube-dev-gateway
+          --for=condition=Programmed --timeout=180s
+      changed_when: false
+
+    - name: Afișează adresa IP externă alocată Gateway-ului
+      ansible.builtin.command:
+        cmd: >
+          kubectl -n gateway get gateway kube-dev-gateway
+          -o jsonpath={.status.addresses[0].value}
+      register: gw_ip
+      changed_when: false
+
+    - name: Rezultat
+      ansible.builtin.debug:
+        msg: "Gateway-ul kube-dev-gateway este expus pe adresa {{ gw_ip.stdout }}"

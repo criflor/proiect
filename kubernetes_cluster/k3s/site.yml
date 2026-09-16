@@ -1,0 +1,31 @@
+---
+- import_playbook: playbooks/01_install_k3s.yml
+- import_playbook: playbooks/02_fetch_kubeconfig.yml
+- import_playbook: playbooks/03_install_cilium.yml
+- import_playbook: playbooks/04_install_cert_manager.yml
+# Numerotat 16 (adăugat ulterior, după introducerea Vault ca PKI) - trebuie
+# să ruleze imediat după cert-manager (are nevoie de namespace-ul și
+# ServiceAccount-ul lui), nu la finalul listei; vezi comentariul din fișier.
+- import_playbook: playbooks/16_configure_vault_pki_auth.yml
+# Numerotat 17 (adăugat ulterior), dar trebuie să ruleze devreme - cu mult
+# înainte de Argo CD (13), care sincronizează ExternalSecret-urile demo-app;
+# vezi comentariul din fișier.
+- import_playbook: playbooks/17_install_external_secrets.yml
+- import_playbook: playbooks/18_install_reloader.yml
+- import_playbook: playbooks/05_configure_gateway.yml
+- import_playbook: playbooks/06_expose_hubble_ui.yml
+- import_playbook: playbooks/07_deploy_demo_app.yml
+- import_playbook: playbooks/08_install_nfs_storageclass.yml
+- import_playbook: playbooks/09_configure_coredns.yml
+- import_playbook: playbooks/10_install_gitlab_runner.yml
+- import_playbook: playbooks/11_configure_registry_trust.yml
+- import_playbook: playbooks/12_deploy_manifests_from_registry.yml
+- import_playbook: playbooks/13_install_argocd.yml
+- import_playbook: playbooks/14_install_extra_components.yml
+- import_playbook: playbooks/15_install_monitoring.yml
+# SSO (Keycloak) - trebuie să ruleze după Argo CD (13) și Keycloak (14),
+# amândouă instalate deja; ordinea internă contează: 19 creează
+# clienții/userul în Keycloak, 20/21 îi consumă (Vault, respectiv Argo CD).
+- import_playbook: playbooks/19_configure_sso_keycloak.yml
+- import_playbook: playbooks/20_configure_sso_vault.yml
+- import_playbook: playbooks/21_configure_sso_argocd.yml

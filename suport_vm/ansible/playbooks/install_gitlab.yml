@@ -1,0 +1,211 @@
+---
+# Instalează GitLab CE pe VM-ul de suport, cu toate datele (repo-uri, registry
+# de containere, baza de date internă) pe volumul LVM dedicat (/data/gitlab),
+# prin bind-mount peste /var/opt/gitlab - locul standard unde Omnibus scrie
+# tot. Astfel, extinderea spațiului (LVM) rămâne complet transparentă pentru
+# GitLab: se extinde vg_gitlab, nu se schimbă nicio configurare GitLab.
+- name: Instalare GitLab CE
+  hosts: suport
+  become: true
+
+  vars:
+    gitlab_hostname: gitlab.kube-dev.local
+    gitlab_registry_port: 5050
+    ssl_dir: /etc/gitlab/ssl
+    vault_secret_path: secret/data/gitlab/root_password
+    # Rulează pe chiar hostul Vault-ului - folosește listener-ul intern de
+    # bootstrap (plain HTTP, doar loopback), nu adresa externă HTTPS din
+    # group_vars (irelevantă pentru trafic care nu iese de pe acest host).
+    vault_addr: "http://127.0.0.1:8201"
+
+  tasks:
+    - name: Bind-mount /data/gitlab peste /var/opt/gitlab (stocare GitLab pe volumul LVM dedicat)
+      ansible.builtin.mount:
+        path: /var/opt/gitlab
+        src: /data/gitlab
+        fstype: none
+        opts: bind
+        state: mounted
+
+    - name: Adaugă repository-ul oficial GitLab CE (idempotent - scriptul verifică singur dacă există deja)
+      ansible.builtin.shell:
+        cmd: curl -fsSL https://packages.gitlab.com/install/repositories/gitlab/gitlab-ce/script.deb.sh | bash
+        creates: /etc/apt/sources.list.d/gitlab_gitlab-ce.list
+
+    - name: Creează directorul pentru certificate (înainte ca pachetul GitLab să existe)
+      ansible.builtin.file:
+        path: "{{ ssl_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: Citește tokenul root Vault
+      ansible.builtin.slurp:
+        src: "{{ vault_init_file }}"
+      register: vault_root_read
+      delegate_to: localhost
+      become: false
+
+    - name: Verifică dacă certificatul GitLab a fost deja emis
+      ansible.builtin.stat:
+        path: "{{ ssl_dir }}/{{ gitlab_hostname }}.crt"
+      register: gitlab_cert_check
+
+    # Certificat emis din intermediara Vault (rolul "kube-dev", vezi
+    # configure_vault_pki.yml), nu self-signed - clienții au nevoie doar de
+    # rădăcina Vault (deja sincronizată acolo) ca să aibă încredere în el.
+    # Fișierul .crt conține lanțul complet (leaf + intermediară), pe care
+    # nginx-ul GitLab trebuie să-l prezinte clienților.
+    - name: Emite certificatul GitLab din Vault PKI (o singură dată)
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/pki_int/issue/kube-dev"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        body_format: json
+        body:
+          common_name: "{{ gitlab_hostname }}"
+        status_code: 200
+      register: gitlab_cert_issue
+      when: not gitlab_cert_check.stat.exists
+
+    - name: Scrie certificatul GitLab (leaf + intermediară)
+      ansible.builtin.copy:
+        content: "{{ gitlab_cert_issue.json.data.certificate }}\n{{ gitlab_cert_issue.json.data.issuing_ca }}"
+        dest: "{{ ssl_dir }}/{{ gitlab_hostname }}.crt"
+        mode: "0644"
+      when: gitlab_cert_issue is not skipped
+      notify: Repornește nginx GitLab
+
+    - name: Scrie cheia privată a certificatului GitLab
+      ansible.builtin.copy:
+        content: "{{ gitlab_cert_issue.json.data.private_key }}"
+        dest: "{{ ssl_dir }}/{{ gitlab_hostname }}.key"
+        mode: "0600"
+      when: gitlab_cert_issue is not skipped
+      no_log: true
+      notify: Repornește nginx GitLab
+
+    # Verificăm dacă baza de date internă a fost deja populată (nu doar dacă
+    # /etc/gitlab/gitlab.rb există) - gitlab.rb se scrie la fiecare rulare,
+    # inclusiv una eșuată înainte ca baza de date să fi fost creată; parola
+    # de root poate fi setată explicit DOAR înainte ca acest fișier să existe.
+    - name: Verifică dacă baza de date internă GitLab a fost deja populată
+      ansible.builtin.stat:
+        path: /var/opt/gitlab/postgresql/data/PG_VERSION
+      register: gitlab_rb_check
+
+    - name: Verifică dacă parola de root există deja în Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/{{ vault_secret_path }}"
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        status_code: [200, 404]
+      register: root_pw_check
+
+    # Parola de root se poate seta explicit DOAR la primul reconfigure (când
+    # baza de date internă GitLab e populată prima dată) - de-aia se
+    # generează și se scrie în Vault o singură dată, înainte de instalare.
+    - name: Generează parola de root GitLab (doar la prima instalare)
+      ansible.builtin.command:
+        cmd: openssl rand -base64 18
+      register: root_pw_gen
+      when: not gitlab_rb_check.stat.exists and root_pw_check.status == 404
+
+    - name: Scrie parola de root în Vault (o singură dată)
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/{{ vault_secret_path }}"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        body_format: json
+        body:
+          data:
+            value: "{{ root_pw_gen.stdout }}"
+        status_code: 200
+      when: root_pw_gen is not skipped
+      no_log: true
+
+    # Cazul de recuperare: baza de date GitLab e deja populată (nu se mai
+    # poate seta parola prin gitlab.rb), dar Vault nu are nicio valoare
+    # pentru ea - se poate întâmpla dacă parola a fost generată/folosită
+    # înainte ca acest playbook să fi fost migrat pe Vault (istoric local,
+    # șters ulterior fără backfill). Resetare sigură, prin mecanismul oficial
+    # GitLab (`gitlab-rails runner`), nu o presupunere despre ce ar fi fost
+    # parola veche.
+    - name: Resetează parola de root GitLab (recuperare - Vault nu are nicio valoare, dar DB există deja)
+      ansible.builtin.command:
+        cmd: openssl rand -base64 18
+      register: root_pw_reset
+      when: gitlab_rb_check.stat.exists and root_pw_check.status == 404
+
+    - name: Aplică parola nouă direct în GitLab
+      ansible.builtin.shell:
+        cmd: >
+          gitlab-rails runner "
+          user = User.find_by_username('root');
+          user.password = '{{ root_pw_reset.stdout }}';
+          user.password_confirmation = '{{ root_pw_reset.stdout }}';
+          user.save!
+          "
+      when: root_pw_reset is not skipped
+      no_log: true
+
+    - name: Scrie parola resetată în Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/{{ vault_secret_path }}"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+        body_format: json
+        body:
+          data:
+            value: "{{ root_pw_reset.stdout }}"
+        status_code: 200
+      when: root_pw_reset is not skipped
+      no_log: true
+
+    - name: Citește parola de root din Vault
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/{{ vault_secret_path }}"
+        headers:
+          X-Vault-Token: "{{ (vault_root_read.content | b64decode | from_json).root_token }}"
+      register: root_pw_read
+      when: not gitlab_rb_check.stat.exists
+      no_log: true
+
+    - name: Scrie configurația GitLab (/etc/gitlab/gitlab.rb)
+      ansible.builtin.template:
+        src: gitlab.rb.j2
+        dest: /etc/gitlab/gitlab.rb
+        mode: "0600"
+      vars:
+        initial_root_password: "{{ root_pw_read.json.data.data.value if not gitlab_rb_check.stat.exists else '' }}"
+        is_first_install: "{{ not gitlab_rb_check.stat.exists }}"
+      notify: Reconfigurează GitLab
+      no_log: true
+
+    - name: Instalează pachetul gitlab-ce (poate dura câteva minute)
+      ansible.builtin.apt:
+        name: gitlab-ce
+        state: present
+        update_cache: true
+      notify: Reconfigurează GitLab
+
+    - name: Forțează reconfigurarea GitLab acum (nu la finalul playbook-ului)
+      ansible.builtin.meta: flush_handlers
+
+  handlers:
+    - name: Reconfigurează GitLab
+      ansible.builtin.command:
+        cmd: gitlab-ctl reconfigure
+      changed_when: true
+
+    # "reconfigure" rulează cookbook-urile Chef ale GitLab, dar acestea nu
+    # știu despre certificatul scris direct de noi pe disc (nu prin propria
+    # logică de generare a GitLab) - fără un restart explicit, nginx
+    # continuă să servească certificatul vechi, deja încărcat în memorie
+    # (verificat practic - vezi documentația, secțiunea "Probleme întâlnite").
+    - name: Repornește nginx GitLab
+      ansible.builtin.command:
+        cmd: gitlab-ctl restart nginx
+      changed_when: true

@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="ro">
+<head>
+  <meta charset="utf-8">
+  <title>Cont autentificat</title>
+  <style>
+    body { font-family: sans-serif; max-width: 320px; margin: 80px auto; }
+    button { padding: 8px 16px; }
+  </style>
+</head>
+<body>
+  <h1>Bun venit, {{ username }}!</h1>
+  <form method="post" action="{{ url_for('logout') }}">
+    <button type="submit">Deconectare</button>
+  </form>
+</body>
+</html>

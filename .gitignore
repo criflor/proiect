@@ -1,0 +1,24 @@
+# Pool-uri de stocare libvirt (create de terraform-provider-libvirt, deținute
+# de root - inaccesibile userului curent, git emite altfel "Permission
+# denied" la fiecare git status/add/commit, dând impresia de blocaj).
+/vms/
+/vms-suport/
+
+# Imaginea cloud Ubuntu (~600MB) - regenerată/verificată automat de
+# iso/download_cloud_image.sh (hash fixat), nu are ce căuta într-un
+# repo git (GitHub oricum respinge fișiere peste 100MB).
+/iso/*.img
+
+# Fișiere temporare de editor (ex. swap vim, poate conține fragmente
+# din fișiere sensibile deschise accidental, ca .vault_init.json).
+*.swp
+*.swo
+*~
+
+# Documentația veche (din rasirom) - scoasă intenționat din acest repo,
+# urmează să fie înlocuită cu una refăcută.
+/decizii.md
+/decizii-profi.md
+/decizii-demo-app.md
+/documentatie.md
+/instalare.md

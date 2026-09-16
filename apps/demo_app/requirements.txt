@@ -1,0 +1,13 @@
+flask==3.1.2
+psycopg2-binary==2.9.10
+bcrypt==4.3.0
+gunicorn==23.0.0
+
+# Instrumentare OpenTelemetry (cerința 10 - monitorizare): trace-uri trimise
+# via OTLP către colectorul din cluster, fără cod adăugat în app.py
+# (auto-instrumentare Flask + psycopg2 prin "opentelemetry-instrument", vezi
+# Dockerfile).
+opentelemetry-distro==0.51b0
+opentelemetry-exporter-otlp==1.30.0
+opentelemetry-instrumentation-flask==0.51b0
+opentelemetry-instrumentation-psycopg2==0.51b0

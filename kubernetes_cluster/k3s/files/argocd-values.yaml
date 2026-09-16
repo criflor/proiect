@@ -1,0 +1,21 @@
+# ArgoCD servește HTTP intern - Cilium Gateway face terminarea TLS la
+# margine (același tipar folosit deja pentru Hubble UI), cu certificatul deja
+# emis de cert-manager pentru "*.kube-dev.local".
+server:
+  extraArgs:
+    - --insecure
+  # Metrici Prometheus (cerința 10 - monitorizare) - dezactivate implicit în
+  # chart, fără niciun Service dedicat de scraping.
+  metrics:
+    enabled: true
+
+# Metricile "argocd_app_info"/"argocd_app_sync_total" etc. (folosite de
+# dashboard-ul predefinit ArgoCD din SigNoz) vin specific de aici
+# (application-controller), nu de pe server.
+controller:
+  metrics:
+    enabled: true
+
+repoServer:
+  metrics:
+    enabled: true

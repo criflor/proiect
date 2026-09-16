@@ -1,0 +1,50 @@
+---
+# Instalează Reloader (stakater/reloader) - controller care urmărește
+# ConfigMap/Secret și declanșează singur un rolling-restart al
+# Deployment/StatefulSet-urilor care le referă, imediat ce conținutul se
+# schimbă (hash calculat automat, injectat ca adnotare pe pod template).
+#
+# Motivul concret: variabilele de mediu (secretKeyRef/envFrom.secretRef) se
+# citesc O SINGURĂ DATĂ, la pornirea containerului - nici External Secrets
+# Operator (§17), nici Argo CD nu repornesc automat pod-urile când o valoare
+# se schimbă în Vault (ESO doar actualizează Secret-ul Kubernetes; Argo CD
+# nu urmărește deloc conținutul acelui Secret, doar manifestul
+# ExternalSecret din git - nu există "drift" de detectat din perspectiva
+# lui). Reloader e piesa lipsă din acest lanț.
+#
+# Aplicat SELECTIV, prin adnotare explicită pe fiecare Deployment/StatefulSet
+# (`reloader.stakater.com/auto: "true"`, vezi apps/demo_app/k8s/base/) - nu
+# global (`--auto-reload-all`), ca să nu repornească involuntar componente
+# unde asta n-ar avea sens (ex. GitLab Runner).
+- name: Instalare Reloader
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+
+  vars:
+    kubeconfig: "{{ local_kubeconfig_path }}"
+
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+
+  tasks:
+    - name: Adaugă/actualizează repo-ul Helm al Reloader
+      ansible.builtin.command:
+        cmd: helm repo add stakater https://stakater.github.io/stakater-charts
+      register: helm_repo_add
+      changed_when: "'has been added' in helm_repo_add.stdout"
+
+    - name: Instalează/actualizează Reloader via Helm
+      ansible.builtin.command:
+        cmd: >
+          helm upgrade --install reloader stakater/reloader
+          --namespace reloader
+          --create-namespace
+      register: reloader_helm
+      changed_when: "'has been upgraded' in reloader_helm.stdout or 'has been installed' in reloader_helm.stdout"
+
+    - name: Așteaptă ca Reloader să fie disponibil
+      ansible.builtin.command:
+        cmd: kubectl -n reloader rollout status deployment/reloader-reloader --timeout=120s
+      changed_when: false

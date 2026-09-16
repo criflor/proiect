@@ -1,0 +1,34 @@
+---
+# Instalează suportul NFS pe nodurile clusterului k3s și montează exportul
+# de pe VM-ul de suport - necesar atât pentru verificare directă a
+# conectivității, cât și pentru ca kubelet să poată monta volume NFS în poduri
+# (StorageClass-ul dinamic configurat în k3s/ folosește același export).
+- name: Instalare client NFS și montare export
+  hosts: k8s_cluster
+  become: true
+
+  vars:
+    nfs_server: 10.10.10.20
+    nfs_export_path: /data/nfs
+    nfs_mount_path: /mnt/nfs
+
+  tasks:
+    - name: Instalează pachetele client NFS (nfs-common - necesar și pentru kubelet)
+      ansible.builtin.apt:
+        name: nfs-common
+        state: present
+        update_cache: true
+
+    - name: Creează punctul de montare
+      ansible.builtin.file:
+        path: "{{ nfs_mount_path }}"
+        state: directory
+        mode: "0755"
+
+    - name: Adaugă intrarea persistentă în /etc/fstab
+      ansible.builtin.mount:
+        path: "{{ nfs_mount_path }}"
+        src: "{{ nfs_server }}:{{ nfs_export_path }}"
+        fstype: nfs
+        opts: "defaults,nofail,_netdev"
+        state: mounted
