@@ -398,13 +398,26 @@
         state: started
         enabled: true
 
-    - name: Adaugă {{ signoz_hostname }} în /etc/hosts (mașina de control)
-      ansible.builtin.lineinfile:
-        path: /etc/hosts
-        line: "10.10.10.20 {{ signoz_hostname }}"
-        regexp: "signoz\\.kube-dev\\.local$"
+    # Înregistrarea în /etc/hosts (mașina de control) NU se mai face de aici
+    # (necesita "become: true", adică sudo, direct din Ansible - evitat
+    # intenționat) - se face o singură dată, la început, prin
+    # ./setup_hosts.sh (rulat manual, cu sudo), înainte de install.sh.
+    # - name: Adaugă {{ signoz_hostname }} în /etc/hosts (mașina de control)
+    #   ansible.builtin.lineinfile:
+    #     path: /etc/hosts
+    #     line: "10.10.10.20 {{ signoz_hostname }}"
+    #     regexp: "signoz\\.kube-dev\\.local$"
+    #   delegate_to: localhost
+    #   become: true
+
+    - name: Validează că {{ signoz_hostname }} e rezolvabil (fără sudo - doar citește /etc/hosts, nu-l scrie)
+      ansible.builtin.command: "getent hosts {{ signoz_hostname }}"
       delegate_to: localhost
-      become: true
+      register: signoz_hosts_check
+      changed_when: false
+      failed_when: >-
+        signoz_hosts_check.rc != 0 or
+        '10.10.10.20' not in signoz_hosts_check.stdout
 
   handlers:
     - name: Repornește nginx SigNoz

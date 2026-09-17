@@ -5,6 +5,12 @@
 # obligatorie - suport_vm întotdeauna înainte de kubernetes_cluster (registry
 # de imagini, Vault pentru secrete/certificate, NFS - vezi decizii.md).
 #
+# Precondiție - rulează o singură dată, cu sudo, ÎNAINTE de acest script:
+#   sudo ./setup_hosts.sh
+# (înregistrează în /etc/hosts hostname-urile UI-urilor expuse - argocd,
+# keycloak, hubble, demo, gitlab, vault, signoz). Acest script (install.sh)
+# NU cere niciodată sudo - rulează integral ca user normal.
+#
 # Fiecare pas Terraform/Ansible e idempotent - dacă scriptul eșuează la
 # jumătate (ex. o VM pornește mai greu), rulează-l din nou; pașii deja
 # finalizați nu vor face nimic în plus la a doua rulare.

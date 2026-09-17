@@ -23,6 +23,6 @@
     - name: Afișează adresa Hubble UI
       ansible.builtin.debug:
         msg: >-
-          Hubble UI e disponibil la https://hubble.kube-dev.local/ (adaugă
-          "10.10.10.192 hubble.kube-dev.local" în /etc/hosts pe mașina de pe
-          care accesezi, sau configurează DNS-ul intern al rețelei).
+          Hubble UI e disponibil la https://hubble.kube-dev.local/ - dacă nu
+          rezolvă, rulează "sudo ./setup_hosts.sh" din rădăcina proiectului
+          (înainte de install.sh, sau oricând ulterior).

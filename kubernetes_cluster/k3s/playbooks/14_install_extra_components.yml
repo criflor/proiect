@@ -204,12 +204,24 @@
       register: keycloak_route_apply
       changed_when: "'unchanged' not in keycloak_route_apply.stdout"
 
-    - name: Adaugă keycloak.kube-dev.local în /etc/hosts (mașina de control)
-      ansible.builtin.lineinfile:
-        path: /etc/hosts
-        line: "10.10.10.192 keycloak.kube-dev.local"
-        regexp: "keycloak\\.kube-dev\\.local$"
-      become: true
+    # Înregistrarea în /etc/hosts (mașina de control) NU se mai face de aici
+    # (necesita "become: true", adică sudo, direct din Ansible - evitat
+    # intenționat) - se face o singură dată, la început, prin
+    # ./setup_hosts.sh (rulat manual, cu sudo), înainte de install.sh.
+    # - name: Adaugă keycloak.kube-dev.local în /etc/hosts (mașina de control)
+    #   ansible.builtin.lineinfile:
+    #     path: /etc/hosts
+    #     line: "10.10.10.192 keycloak.kube-dev.local"
+    #     regexp: "keycloak\\.kube-dev\\.local$"
+    #   become: true
+
+    - name: Validează că keycloak.kube-dev.local e rezolvabil (fără sudo - doar citește /etc/hosts, nu-l scrie)
+      ansible.builtin.command: getent hosts keycloak.kube-dev.local
+      register: keycloak_hosts_check
+      changed_when: false
+      failed_when: >-
+        keycloak_hosts_check.rc != 0 or
+        '10.10.10.192' not in keycloak_hosts_check.stdout
 
     - name: Citește parola de admin Keycloak (dacă e generată de chart)
       ansible.builtin.command:
