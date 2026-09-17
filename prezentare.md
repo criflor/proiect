@@ -98,3 +98,16 @@ Conține cheia de unseal și token-ul root (JSON simplu). E singurul fișier sec
 
 redis si kafka nu sunt expuse deoarece nu au autentificare
 hubble este expus de curiozitate
+
+Lista endpoint-uri
+
+URL                             USERNAME                                        Rol
+gitlab.kube-dev.local          appadm,root                                      ui
+gitlab.kube-dev.local:5050     registry_deploy_token                            pull imagini in cluster
+vault.kube-dev.local:8200      root (token), appadm (parola), ssoadm(parola)    ui
+signoz.kube-dev.local:8443     admin@kube-dev.local                             ui
+argocd.kube-dev.local          appadm (parola) ssoadm (parola)                  ui
+demo.kube-dev.local            appadm                                           ui
+dev-demo.kube-dev.local        appadm                                           ui
+keycloak.kube-dev.local        admin, ssoadm                                    ui
+hubble.kube-dev.local          -                                                ui
