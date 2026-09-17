@@ -73,11 +73,9 @@ La instalare o sa vrea sa faca urmatoarele inregistrari in /etc/hosts:
 10.10.10.20 gitlab.kube-dev.local
 10.10.10.192 argocd.kube-dev.local
 10.10.10.192 keycloak.kube-dev.local
-# 10.10.10.192 ci-events.kube-dev.local
 10.10.10.20 vault.kube-dev.local
 10.10.10.20 signoz.kube-dev.local
 
-Stiu ca este o inconsistenta aici, puteam sa le adaug din install.sh, partial sau pe toate ...
 
 Instalare
 
